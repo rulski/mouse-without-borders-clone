@@ -112,6 +112,15 @@ class PynputBackend:
         self._keyboard_listener: Any = None
 
     def screen_size(self) -> tuple[int, int]:
+        if sys.platform.startswith("win"):
+            try:
+                import ctypes
+
+                user32 = ctypes.windll.user32
+                return (int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1)))
+            except Exception:
+                pass
+
         try:
             import tkinter as tk
 
@@ -122,14 +131,6 @@ class PynputBackend:
             root.destroy()
             return (width, height)
         except Exception:
-            if sys.platform.startswith("win"):
-                try:
-                    import ctypes
-
-                    user32 = ctypes.windll.user32
-                    return (int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1)))
-                except Exception:
-                    pass
             return (1920, 1080)
 
     def current_position(self) -> tuple[int, int]:
