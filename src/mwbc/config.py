@@ -58,6 +58,9 @@ class AppConfig:
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = DEFAULT_DASHBOARD_PORT
     backend: str = "auto"
+    clipboard_enabled: bool = True
+    clipboard_poll_seconds: float = 0.5
+    clipboard_max_text_bytes: int = 262_144
     suppress_local_events_when_remote: bool = True
     edge_threshold_px: int = 2
     peers: list[PeerConfig] = field(default_factory=list)
@@ -74,6 +77,9 @@ class AppConfig:
             dashboard_host=str(data.get("dashboard_host", "127.0.0.1")),
             dashboard_port=int(data.get("dashboard_port", DEFAULT_DASHBOARD_PORT)),
             backend=str(data.get("backend", "auto")),
+            clipboard_enabled=bool(data.get("clipboard_enabled", True)),
+            clipboard_poll_seconds=float(data.get("clipboard_poll_seconds", 0.5)),
+            clipboard_max_text_bytes=int(data.get("clipboard_max_text_bytes", 262_144)),
             suppress_local_events_when_remote=bool(data.get("suppress_local_events_when_remote", True)),
             edge_threshold_px=int(data.get("edge_threshold_px", 2)),
             peers=peers,
@@ -88,6 +94,9 @@ class AppConfig:
             "dashboard_host": self.dashboard_host,
             "dashboard_port": self.dashboard_port,
             "backend": self.backend,
+            "clipboard_enabled": self.clipboard_enabled,
+            "clipboard_poll_seconds": self.clipboard_poll_seconds,
+            "clipboard_max_text_bytes": self.clipboard_max_text_bytes,
             "suppress_local_events_when_remote": self.suppress_local_events_when_remote,
             "edge_threshold_px": self.edge_threshold_px,
             "peers": [peer.to_dict() for peer in self.peers],

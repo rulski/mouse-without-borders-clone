@@ -12,6 +12,7 @@ It is an MVP, not a kernel-level input driver. Native input capture/injection is
 - Controller mode that switches to a peer when the pointer hits an edge.
 - Browser controller mode for locked-down devices that can open a web page but cannot run an executable.
 - Host layout editor for moving peer devices to the left, right, top, or bottom edge.
+- Text clipboard sync from always-looking clients back to the host.
 - Pointer locking while remote control is active so relative motion can continue past the local screen edge.
 - Optional local event suppression while controlling a peer, when supported by the OS/backend.
 - Small local dashboard at `http://127.0.0.1:45446`.
@@ -65,6 +66,8 @@ mwbc client --host 192.168.1.10
 Replace `192.168.1.10` with the host machine's LAN IP or DNS name. The client keeps retrying until the host is reachable.
 
 Move the host machine's pointer into a configured edge. For example, `--edge right` means the client is logically to the right of the host screen. Move left on the remote screen edge to return to the host.
+
+When a connected client copies plain text, the client sends that text to the host clipboard. For example, text copied on `MACBOOK` can be pasted back on the Windows host.
 
 ## Layout Editor
 
@@ -192,6 +195,9 @@ Example:
   "dashboard_host": "127.0.0.1",
   "dashboard_port": 45446,
   "backend": "auto",
+  "clipboard_enabled": true,
+  "clipboard_poll_seconds": 0.5,
+  "clipboard_max_text_bytes": 262144,
   "suppress_local_events_when_remote": true,
   "edge_threshold_px": 2,
   "peers": [

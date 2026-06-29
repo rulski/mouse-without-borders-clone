@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from .clipboard import Clipboard, ClipboardError, truncate_text
 from .config import AppConfig, PeerConfig
 from .input_backend import InputBackend, apply_input_event
 from .protocol import AuthenticationError, Message, decode_message, decode_with_any_secret, encode_message
@@ -210,11 +211,13 @@ class AgentServer:
         backend: InputBackend,
         state: StateStore,
         host_registry: HostClientRegistry | None = None,
+        clipboard: Clipboard | None = None,
     ) -> None:
         self.config = config
         self.backend = backend
         self.state = state
         self.host_registry = host_registry
+        self.clipboard = clipboard
         self._server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
@@ -314,6 +317,9 @@ class AgentServer:
                 self.state.update_peer(client.name, last_seen=time.time(), error=None)
                 if message.type == "heartbeat":
                     continue
+                if message.type == "clipboard":
+                    await self._apply_clipboard_message(message, client.name)
+                    continue
                 logger.debug("ignoring hosted client message type %s from %s", message.type, client.name)
         finally:
             if self.host_registry is not None:
@@ -325,10 +331,22 @@ class AgentServer:
             self.state.increment("events_received")
         elif message.type == "control":
             self.state.update_incoming(incoming_key, active=message.payload.get("active"))
+        elif message.type == "clipboard":
+            await self._apply_clipboard_message(message, incoming_key)
         elif message.type == "heartbeat":
             return
         else:
             logger.warning("ignoring unknown message type %s", message.type)
+
+    async def _apply_clipboard_message(self, message: Message, source: str) -> None:
+        if self.clipboard is None or not self.config.clipboard_enabled:
+            return
+        if "text" not in message.payload:
+            raise ValueError("clipboard message missing text")
+
+        text = truncate_text(str(message.payload["text"]), self.config.clipboard_max_text_bytes)
+        await asyncio.to_thread(self.clipboard.set_text, text)
+        self.state.update(last_clipboard_source=source, last_clipboard_at=time.time())
 
 
 class ClientConnector:
@@ -340,6 +358,7 @@ class ClientConnector:
         host: str,
         port: int,
         retry_seconds: float = 1.0,
+        clipboard: Clipboard | None = None,
     ) -> None:
         self.config = config
         self.backend = backend
@@ -347,6 +366,7 @@ class ClientConnector:
         self.host = host
         self.port = port
         self.retry_seconds = retry_seconds
+        self.clipboard = clipboard
         self._running = False
         self._task: asyncio.Task[None] | None = None
 
@@ -404,6 +424,12 @@ class ClientConnector:
             host_screen_height=ack.payload.get("screen_height"),
         )
         heartbeat_task = asyncio.create_task(self._send_heartbeats(writer, secret), name="mwbc-client-heartbeat")
+        clipboard_task: asyncio.Task[None] | None = None
+        if self.clipboard is not None and self.config.clipboard_enabled:
+            clipboard_task = asyncio.create_task(
+                self._send_clipboard_changes(writer, secret),
+                name="mwbc-client-clipboard",
+            )
         try:
             while self._running:
                 message = await read_message(reader, secret)
@@ -412,6 +438,10 @@ class ClientConnector:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
+            if clipboard_task is not None:
+                clipboard_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await clipboard_task
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
@@ -422,12 +452,45 @@ class ClientConnector:
             await asyncio.sleep(3)
             await send_message(writer, "heartbeat", {}, secret)
 
+    async def _send_clipboard_changes(self, writer: asyncio.StreamWriter, secret: str) -> None:
+        assert self.clipboard is not None
+        try:
+            last_text = await self._read_clipboard_text()
+        except ClipboardError as exc:
+            last_text = ""
+            self.state.update(clipboard_error=str(exc))
+        while self._running and not writer.is_closing():
+            await asyncio.sleep(max(0.1, self.config.clipboard_poll_seconds))
+            try:
+                text = await self._read_clipboard_text()
+            except ClipboardError as exc:
+                self.state.update(clipboard_error=str(exc))
+                continue
+            if text == last_text:
+                continue
+            last_text = text
+            payload = {
+                "source": self.config.machine_name,
+                "text": truncate_text(text, self.config.clipboard_max_text_bytes),
+            }
+            await send_message(writer, "clipboard", payload, secret)
+            self.state.update(clipboard_error=None, last_clipboard_sent=time.time())
+
+    async def _read_clipboard_text(self) -> str:
+        assert self.clipboard is not None
+        return await asyncio.to_thread(self.clipboard.get_text)
+
     async def _handle_host_message(self, message: Message) -> None:
         if message.type == "input":
             apply_input_event(self.backend, message.payload)
             self.state.increment("events_received")
         elif message.type == "control":
             self.state.update(host_active=message.payload.get("active"))
+        elif message.type == "clipboard":
+            if self.clipboard is not None and self.config.clipboard_enabled:
+                text = truncate_text(str(message.payload.get("text", "")), self.config.clipboard_max_text_bytes)
+                await asyncio.to_thread(self.clipboard.set_text, text)
+                self.state.update(last_clipboard_received=time.time())
         elif message.type == "heartbeat":
             return
         else:

@@ -20,6 +20,7 @@ from .config import (
     load_config,
     save_config,
 )
+from .clipboard import create_clipboard
 from .controller import BorderController
 from .dashboard import DashboardServer
 from .input_backend import apply_input_event, create_backend
@@ -273,6 +274,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     if getattr(args, "dashboard_port", None):
         config.dashboard_port = args.dashboard_port
     backend = create_backend(config.backend)
+    clipboard = create_clipboard() if config.clipboard_enabled else None
     state = StateStore(machine_name=config.machine_name, backend_name=backend.name)
     width, height = backend.screen_size()
     state.update(local_screen_width=width, local_screen_height=height)
@@ -307,7 +309,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         host_registry = HostClientRegistry(state)
 
     if args.command in {"run", "agent", "host"}:
-        agent = AgentServer(config, backend, state, host_registry=host_registry)
+        agent = AgentServer(config, backend, state, host_registry=host_registry, clipboard=clipboard)
         await agent.start()
         tasks.append(asyncio.create_task(agent.serve_forever(), name="mwbc-agent"))
 
@@ -319,6 +321,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             host=args.host,
             port=args.port,
             retry_seconds=args.retry_seconds,
+            clipboard=clipboard,
         )
         await connector.start()
 

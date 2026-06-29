@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 
+from mwbc.clipboard import NullClipboard
 from mwbc.config import AppConfig, PeerConfig
 from mwbc.input_backend import NullBackend
 from mwbc.network import AgentServer, ClientConnector, HostClientRegistry
@@ -50,6 +51,58 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             await connector.stop()
             await server.stop()
 
+    async def test_always_looking_client_sends_clipboard_to_host(self) -> None:
+        host_config = AppConfig(
+            machine_name="host",
+            pairing_secret="secret",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            clipboard_poll_seconds=0.05,
+            peers=[PeerConfig(name="client", edge="right")],
+        )
+        host_backend = NullBackend()
+        host_clipboard = NullClipboard()
+        host_state = StateStore("host", host_backend.name)
+        host_state.register_peer("client", "", 45445, "right")
+        registry = HostClientRegistry(host_state)
+        server = AgentServer(
+            host_config,
+            host_backend,
+            host_state,
+            host_registry=registry,
+            clipboard=host_clipboard,
+        )
+        await server.start()
+        assert server._server is not None
+        port = server._server.sockets[0].getsockname()[1]
+
+        client_config = AppConfig(
+            machine_name="client",
+            pairing_secret="secret",
+            clipboard_poll_seconds=0.05,
+        )
+        client_backend = NullBackend()
+        client_clipboard = NullClipboard("initial")
+        client_state = StateStore("client", client_backend.name)
+        connector = ClientConnector(
+            config=client_config,
+            backend=client_backend,
+            state=client_state,
+            host="127.0.0.1",
+            port=port,
+            retry_seconds=0.05,
+            clipboard=client_clipboard,
+        )
+
+        try:
+            await connector.start()
+            await self._wait_for_hosted_client(registry, "client")
+            client_clipboard.set_text("copied from client")
+            await self._wait_for_clipboard(host_clipboard, "copied from client")
+        finally:
+            await connector.stop()
+            await server.stop()
+
     async def _wait_for_hosted_client(self, registry: HostClientRegistry, name: str):
         for _ in range(60):
             client = await registry.get(name)
@@ -58,7 +111,13 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
         self.fail(f"{name} did not connect")
 
+    async def _wait_for_clipboard(self, clipboard: NullClipboard, expected: str) -> None:
+        for _ in range(60):
+            if clipboard.get_text() == expected:
+                return
+            await asyncio.sleep(0.05)
+        self.fail(f"clipboard did not become {expected!r}")
+
 
 if __name__ == "__main__":
     unittest.main()
-
