@@ -45,6 +45,7 @@ class BorderController:
         self.lock_point = Point(max(1, self.local_size.width // 2), max(1, self.local_size.height // 2))
         self._event_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._active_watch_task: asyncio.Task[None] | None = None
         self._ignore_next_lock_motion = False
 
         for peer in config.peers:
@@ -56,10 +57,11 @@ class BorderController:
         self._start_capture(suppress=False)
         self._event_task = asyncio.create_task(self._event_pump(), name="mwbc-event-pump")
         self._reconnect_task = asyncio.create_task(self._reconnect_loop(), name="mwbc-reconnect")
+        self._active_watch_task = asyncio.create_task(self._active_watch_loop(), name="mwbc-active-watch")
 
     async def stop(self) -> None:
         self.backend.stop_capture()
-        for task in (self._event_task, self._reconnect_task):
+        for task in (self._event_task, self._reconnect_task, self._active_watch_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -116,7 +118,7 @@ class BorderController:
                     await self._send_key("key_release", values[0])
             except Exception as exc:
                 logger.exception("controller event failed")
-                self.state.set_error(str(exc))
+                await self._recover_local(f"controller event failed: {exc}")
 
     async def _reconnect_loop(self) -> None:
         while True:
@@ -128,6 +130,33 @@ class BorderController:
                     await client.connect()
                 except Exception as exc:
                     self.state.update_peer(name, connected=False, error=str(exc))
+
+    async def _active_watch_loop(self) -> None:
+        while True:
+            await asyncio.sleep(0.25)
+            active = self.active
+            if active is None:
+                continue
+            connected = bool(getattr(active.client, "connected", False))
+            if not connected:
+                await self._recover_local(f"{active.peer.name} disconnected")
+
+    async def _recover_local(self, reason: str) -> None:
+        active = self.active
+        if active is None:
+            self.state.set_error(reason)
+            self.state.update(active_peer=None)
+            return
+
+        self.active = None
+        self.state.update(active_peer=None)
+        self.state.update_peer(active.peer.name, connected=False, error=reason)
+        self.state.set_error(f"{active.peer.name}: {reason}")
+        if self.config.suppress_local_events_when_remote:
+            self._start_capture(suppress=False)
+        self.backend.move_to(self.lock_point.x, self.lock_point.y)
+        self._ignore_next_lock_motion = True
+        logger.info("returned control to local host after remote failure: %s", reason)
 
     async def _handle_move(self, x: int, y: int) -> None:
         if self.active is None:
