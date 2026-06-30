@@ -13,6 +13,22 @@ from urllib.parse import parse_qs, urlparse
 WebInputHandler = Callable[[list[dict[str, Any]], dict[str, Any]], int]
 LayoutProvider = Callable[[], dict[str, Any]]
 LayoutUpdateHandler = Callable[[dict[str, Any]], dict[str, Any]]
+ManagementHandler = Callable[[str, dict[str, Any]], dict[str, Any]]
+
+MANAGEMENT_GET_ROUTES: dict[str, tuple[str, bool]] = {
+    "/api/capabilities": ("capabilities", False),
+    "/api/service": ("service.status", False),
+    "/api/startup": ("startup.status", True),
+    "/api/logs": ("logs", True),
+}
+MANAGEMENT_POST_ROUTES: dict[str, str] = {
+    "/api/service/start": "service.start",
+    "/api/service/stop": "service.stop",
+    "/api/service/restart": "service.restart",
+    "/api/startup/install": "startup.install",
+    "/api/startup/uninstall": "startup.uninstall",
+    "/api/secret/regenerate": "secret.regenerate",
+}
 
 
 class DashboardServer:
@@ -26,6 +42,7 @@ class DashboardServer:
         web_input_handler: WebInputHandler | None = None,
         layout_provider: LayoutProvider | None = None,
         layout_update_handler: LayoutUpdateHandler | None = None,
+        management_handler: ManagementHandler | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -34,6 +51,7 @@ class DashboardServer:
         self.web_input_handler = web_input_handler
         self.layout_provider = layout_provider
         self.layout_update_handler = layout_update_handler
+        self.management_handler = management_handler
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -47,6 +65,7 @@ class DashboardServer:
         web_input_handler = self.web_input_handler
         layout_provider = self.layout_provider
         layout_update_handler = self.layout_update_handler
+        management_handler = self.management_handler
 
         def current_layout() -> dict[str, Any]:
             if layout_provider is not None:
@@ -66,6 +85,9 @@ class DashboardServer:
                 if parsed.path == "/api/layout":
                     self._send_json(current_layout())
                     return
+                if parsed.path in MANAGEMENT_GET_ROUTES:
+                    self._handle_management_get(parsed)
+                    return
                 if parsed.path == "/controller":
                     self._send_html(render_web_controller(state_provider()))
                     return
@@ -81,6 +103,9 @@ class DashboardServer:
                 parsed = urlparse(self.path)
                 if parsed.path == "/api/layout":
                     self._handle_layout_post(parsed)
+                    return
+                if parsed.path in MANAGEMENT_POST_ROUTES:
+                    self._handle_management_post(parsed)
                     return
                 if parsed.path != "/api/web-input":
                     self.send_error(HTTPStatus.NOT_FOUND)
@@ -142,6 +167,46 @@ class DashboardServer:
                 result.setdefault("ok", True)
                 self._send_json(result)
 
+            def _handle_management_get(self, parsed) -> None:
+                if management_handler is None:
+                    self._send_json({"ok": False, "error": "management API is disabled"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
+
+                action, requires_auth = MANAGEMENT_GET_ROUTES[parsed.path]
+                if requires_auth and not _token_matches(self._auth_token({}, parsed.query), auth_tokens):
+                    self._send_json({"ok": False, "error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                    return
+
+                try:
+                    result = dict(management_handler(action, self._query_payload(parsed.query)))
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return
+                result.setdefault("ok", True)
+                self._send_json(result)
+
+            def _handle_management_post(self, parsed) -> None:
+                if management_handler is None:
+                    self._send_json({"ok": False, "error": "management API is disabled"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
+
+                payload = self._read_json_body(allow_empty=True)
+                if payload is None:
+                    self._send_json({"ok": False, "error": "invalid JSON body"}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                if not _token_matches(self._auth_token(payload, parsed.query), auth_tokens):
+                    self._send_json({"ok": False, "error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                    return
+
+                try:
+                    result = dict(management_handler(MANAGEMENT_POST_ROUTES[parsed.path], payload))
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return
+                result.setdefault("ok", True)
+                self._send_json(result)
+
             def log_message(self, format: str, *args: object) -> None:
                 return None
 
@@ -150,12 +215,17 @@ class DashboardServer:
                 query_token = parse_qs(query).get("token", [""])[0]
                 return token or query_token
 
-            def _read_json_body(self) -> dict[str, Any] | None:
+            def _query_payload(self, query: str) -> dict[str, Any]:
+                return {key: values[-1] for key, values in parse_qs(query).items() if values}
+
+            def _read_json_body(self, *, allow_empty: bool = False) -> dict[str, Any] | None:
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                 except ValueError:
                     return None
-                if length <= 0 or length > 262_144:
+                if length <= 0:
+                    return {} if allow_empty else None
+                if length > 262_144:
                     return None
                 try:
                     data = json.loads(self.rfile.read(length).decode("utf-8"))

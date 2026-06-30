@@ -3,10 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import os
 import logging
 import signal
 import socket
+import subprocess
+import sys
 import threading
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +28,7 @@ from .clipboard import create_clipboard
 from .controller import BorderController
 from .dashboard import DashboardServer
 from .input_backend import apply_input_event, create_backend
+from .logging_utils import install_recent_log_handler, recent_logs
 from .network import AgentServer, ClientConnector, HostClientRegistry
 from .startup import StartupError, StartupOptions, install_startup, startup_status, uninstall_startup
 from .state import StateStore
@@ -99,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    install_recent_log_handler()
 
     if args.command == "init":
         return cmd_init(args)
@@ -301,6 +307,171 @@ async def _send_peer_settings(config: AppConfig, host_registry: HostClientRegist
             logging.getLogger(__name__).info("failed to send settings to %s: %s", peer.name, exc)
 
 
+def _build_management_handler(
+    config: AppConfig,
+    config_path: Path,
+    args: argparse.Namespace,
+    state: StateStore,
+    loop: asyncio.AbstractEventLoop,
+    stop_event: asyncio.Event,
+    restart_request: dict[str, list[str] | None],
+    auth_tokens: list[str],
+):
+    def handle(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if action == "capabilities":
+            return _capabilities_payload()
+        if action == "service.status":
+            return _service_status_payload(config, args, state)
+        if action == "service.stop":
+            loop.call_soon_threadsafe(stop_event.set)
+            return {"ok": True, "action": "stop", "message": "MWBC is stopping"}
+        if action == "service.restart":
+            restart_request["argv"] = _build_service_argv(config, args, payload)
+            loop.call_soon_threadsafe(stop_event.set)
+            return {"ok": True, "action": "restart", "message": "MWBC is restarting"}
+        if action == "service.start":
+            restart_request["argv"] = _build_service_argv(config, args, payload)
+            loop.call_soon_threadsafe(stop_event.set)
+            return {"ok": True, "action": "start", "message": "MWBC is starting the requested mode"}
+        if action == "startup.status":
+            return {"startup": _startup_status_payload(startup_status())}
+        if action == "startup.install":
+            status = install_startup(_startup_options_from_payload(config, args, payload))
+            return {"startup": _startup_status_payload(status)}
+        if action == "startup.uninstall":
+            status = uninstall_startup()
+            return {"startup": _startup_status_payload(status)}
+        if action == "logs":
+            limit = int(payload.get("limit", 100))
+            return {"logs": recent_logs(limit)}
+        if action == "secret.regenerate":
+            config.pairing_secret = generate_secret()
+            save_config(config, config_path)
+            auth_tokens[:] = config.accepted_secrets()
+            return {
+                "pairing_secret": config.pairing_secret,
+                "dashboard_url": _dashboard_url(config),
+                "layout_url": _layout_url(config),
+                "controller_url": _controller_url(config),
+            }
+        raise ValueError(f"unknown management action {action!r}")
+
+    return handle
+
+
+def _capabilities_payload() -> dict[str, Any]:
+    return {
+        "service": {
+            "status": True,
+            "start": True,
+            "stop": True,
+            "restart": True,
+            "start_requires_running_api": True,
+        },
+        "startup": {
+            "status": True,
+            "install": True,
+            "uninstall": True,
+        },
+        "config": {
+            "secret_regeneration": True,
+            "layout": True,
+            "keep_awake": True,
+        },
+        "logs": True,
+    }
+
+
+def _service_status_payload(config: AppConfig, args: argparse.Namespace, state: StateStore) -> dict[str, Any]:
+    snapshot = state.snapshot()
+    return {
+        "running": True,
+        "pid": os.getpid(),
+        "mode": snapshot.get("mode") or args.command,
+        "command": args.command,
+        "config_path": str(args.config.expanduser()),
+        "dashboard_url": _dashboard_url(config),
+        "layout_url": _layout_url(config) if args.command in {"run", "host"} else None,
+        "controller_url": _controller_url(config) if args.command in {"run", "host"} else None,
+        "backend": snapshot.get("backend"),
+        "machine_name": snapshot.get("machine_name"),
+        "uptime_seconds": snapshot.get("uptime_seconds"),
+    }
+
+
+def _startup_status_payload(status) -> dict[str, Any]:
+    return asdict(status)
+
+
+def _startup_options_from_payload(config: AppConfig, args: argparse.Namespace, payload: dict[str, Any]) -> StartupOptions:
+    mode = str(payload.get("mode") or getattr(args, "command", "host"))
+    if mode not in {"run", "agent", "controller", "host", "client"}:
+        raise ValueError("startup mode must be run, agent, controller, host, or client")
+    host = payload.get("host")
+    if host is None:
+        host = getattr(args, "host", None)
+    return StartupOptions(
+        mode=mode,
+        config_path=args.config,
+        host=str(host) if host else None,
+        port=int(payload.get("port", getattr(args, "port", config.listen_port))),
+        retry_seconds=float(payload.get("retry_seconds", getattr(args, "retry_seconds", 1.0))),
+        no_dashboard=bool(payload.get("no_dashboard", getattr(args, "no_dashboard", False))),
+        dashboard_host=str(payload.get("dashboard_host", config.dashboard_host)),
+        dashboard_port=int(payload.get("dashboard_port", config.dashboard_port)),
+        backend=payload.get("backend") or getattr(args, "backend", None),
+        log_level=str(payload.get("log_level", getattr(args, "log_level", "INFO"))),
+        keep_alive=bool(payload.get("keep_alive", False)),
+    )
+
+
+def _build_service_argv(config: AppConfig, args: argparse.Namespace, payload: dict[str, Any]) -> list[str]:
+    mode = str(payload.get("mode") or args.command)
+    if mode not in {"run", "agent", "controller", "host", "client"}:
+        raise ValueError("mode must be run, agent, controller, host, or client")
+
+    argv = [_python_or_frozen_executable()]
+    if not getattr(sys, "frozen", False):
+        argv.extend(["-m", "mwbc"])
+    argv.extend(["--config", str(args.config.expanduser()), "--log-level", str(payload.get("log_level", args.log_level))])
+    argv.append(mode)
+
+    backend = payload.get("backend") or getattr(args, "backend", None)
+    if backend:
+        argv.extend(["--backend", str(backend)])
+
+    if mode == "client":
+        host = payload.get("host") or getattr(args, "host", None)
+        if not host:
+            raise ValueError("client mode requires host")
+        argv.extend(["--host", str(host), "--port", str(payload.get("port", getattr(args, "port", config.listen_port)))])
+        retry_seconds = payload.get("retry_seconds", getattr(args, "retry_seconds", 1.0))
+        if float(retry_seconds) != 1.0:
+            argv.extend(["--retry-seconds", str(retry_seconds)])
+
+    if mode in {"run", "host"}:
+        if bool(payload.get("no_dashboard", False)):
+            argv.append("--no-dashboard")
+        dashboard_host = str(payload.get("dashboard_host", config.dashboard_host))
+        dashboard_port = int(payload.get("dashboard_port", config.dashboard_port))
+        argv.extend(["--dashboard-host", dashboard_host, "--dashboard-port", str(dashboard_port)])
+
+    return argv
+
+
+def _python_or_frozen_executable() -> str:
+    return sys.executable
+
+
+def _spawn_restart(argv: list[str]) -> None:
+    kwargs: dict[str, Any] = {"cwd": os.getcwd()}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(argv, **kwargs)
+
+
 async def cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     if getattr(args, "backend", None):
@@ -317,6 +488,9 @@ async def cmd_run(args: argparse.Namespace) -> int:
     if getattr(backend, "reason", None):
         state.set_error(f"Using null backend because native input is unavailable: {backend.reason}")
 
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    restart_request: dict[str, list[str] | None] = {"argv": None}
     dashboard: DashboardServer | None = None
     controller_ref: dict[str, BorderController | None] = {"controller": None}
     layout_lock = threading.RLock()
@@ -325,11 +499,12 @@ async def cmd_run(args: argparse.Namespace) -> int:
         host_registry = HostClientRegistry(state)
 
     if args.command in {"run", "host"} and not args.no_dashboard:
+        auth_tokens = config.accepted_secrets()
         dashboard = DashboardServer(
             config.dashboard_host,
             config.dashboard_port,
             state.snapshot,
-            auth_tokens=config.accepted_secrets(),
+            auth_tokens=auth_tokens,
             web_input_handler=_build_web_input_handler(backend, state),
             layout_provider=_build_layout_provider(config, state, layout_lock),
             layout_update_handler=_build_layout_update_handler(
@@ -341,11 +516,22 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 asyncio.get_running_loop(),
                 layout_lock,
             ),
+            management_handler=_build_management_handler(
+                config,
+                args.config,
+                args,
+                state,
+                loop,
+                stop_event,
+                restart_request,
+                auth_tokens,
+            ),
         )
         dashboard.start()
         print(f"Dashboard: {dashboard.url}")
         print(f"Web controller: {_controller_url(config)}")
         print(f"Layout editor: {_layout_url(config)}")
+        print(f"Pairing secret: {config.pairing_secret}")
 
     agent: AgentServer | None = None
     controller: BorderController | None = None
@@ -380,7 +566,6 @@ async def cmd_run(args: argparse.Namespace) -> int:
         mode = "agent"
     state.update(mode=mode)
 
-    stop_event = asyncio.Event()
     _install_signal_handlers(stop_event)
     print(f"{config.machine_name} running with {backend.name} backend. Press Ctrl+C to stop.")
     try:
@@ -400,6 +585,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
             await agent.stop()
         if dashboard is not None:
             dashboard.stop()
+        if restart_request["argv"] is not None:
+            _spawn_restart(restart_request["argv"])
     return 0
 
 
@@ -431,6 +618,13 @@ def _controller_url(config: AppConfig) -> str:
     if host in {"0.0.0.0", "::"}:
         host = _guess_lan_ip()
     return f"http://{host}:{config.dashboard_port}/controller#token={config.pairing_secret}"
+
+
+def _dashboard_url(config: AppConfig) -> str:
+    host = config.dashboard_host
+    if host in {"0.0.0.0", "::"}:
+        host = _guess_lan_ip()
+    return f"http://{host}:{config.dashboard_port}"
 
 
 def _layout_url(config: AppConfig) -> str:

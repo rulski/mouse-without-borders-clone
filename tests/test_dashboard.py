@@ -80,6 +80,49 @@ class DashboardTests(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_management_service_status_is_public(self) -> None:
+        server = self._management_server()
+        try:
+            response = self._get(server, "/api/service")
+            self.assertTrue(response["ok"])
+            self.assertEqual(response["action"], "service.status")
+        finally:
+            server.stop()
+
+    def test_management_logs_requires_token(self) -> None:
+        server = self._management_server()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self._get(server, "/api/logs", token="bad")
+            self.assertEqual(raised.exception.code, 401)
+        finally:
+            server.stop()
+
+    def test_management_post_requires_token(self) -> None:
+        server = self._management_server()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self._post(server, {}, token="bad", path="/api/service/stop")
+            self.assertEqual(raised.exception.code, 401)
+        finally:
+            server.stop()
+
+    def test_management_post_allows_empty_body(self) -> None:
+        server = self._management_server()
+        try:
+            request = urllib.request.Request(
+                f"{self._base_url(server)}/api/service/stop",
+                data=b"",
+                headers={"X-MWBC-Token": "secret"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["action"], "service.stop")
+        finally:
+            server.stop()
+
     def _server(self, backend: NullBackend) -> DashboardServer:
         def handle(events: list[dict], _client_info: dict) -> int:
             for event in events:
@@ -114,6 +157,20 @@ class DashboardTests(unittest.TestCase):
         server.start()
         return server
 
+    def _management_server(self) -> DashboardServer:
+        def handle(action: str, payload: dict) -> dict:
+            return {"action": action, "payload": payload}
+
+        server = DashboardServer(
+            "127.0.0.1",
+            0,
+            lambda: {"machine_name": "HOST"},
+            auth_tokens=["secret"],
+            management_handler=handle,
+        )
+        server.start()
+        return server
+
     def _base_url(self, server: DashboardServer) -> str:
         assert server._httpd is not None
         host, port = server._httpd.server_address
@@ -127,6 +184,14 @@ class DashboardTests(unittest.TestCase):
             headers={"Content-Type": "application/json", "X-MWBC-Token": token},
             method="POST",
         )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _get(self, server: DashboardServer, path: str, *, token: str | None = None) -> dict:
+        headers = {}
+        if token is not None:
+            headers["X-MWBC-Token"] = token
+        request = urllib.request.Request(f"{self._base_url(server)}{path}", headers=headers)
         with urllib.request.urlopen(request, timeout=3) as response:
             return json.loads(response.read().decode("utf-8"))
 

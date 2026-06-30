@@ -78,6 +78,7 @@ When the host starts with the dashboard enabled, it prints a URL like:
 
 ```text
 Layout editor: http://127.0.0.1:45446/layout#token=...
+Pairing secret: ...
 ```
 
 Open that URL on the host. Drag devices to the edge where they physically sit, or use each device's edge selector. Changes are saved to `~/.mwbc/config.json` and the running host refreshes immediately.
@@ -93,6 +94,48 @@ mwbc host
 ```
 
 Then open the printed layout URL and adjust the devices visually if needed.
+
+## Local API for Smith Command Center
+
+Smith Command Center should treat MWBC as a separate local daemon and talk to the dashboard API over localhost:
+
+```text
+MWBC_API_URL=http://127.0.0.1:45446
+MWBC_API_TOKEN=<pairing secret or token from the printed URL>
+```
+
+Unauthenticated read endpoints:
+
+```text
+GET /api/status
+GET /api/layout
+GET /api/capabilities
+GET /api/service
+```
+
+Authenticated endpoints require the pairing secret in `X-MWBC-Token`:
+
+```text
+POST /api/layout
+GET  /api/startup
+GET  /api/logs?limit=100
+POST /api/service/start
+POST /api/service/stop
+POST /api/service/restart
+POST /api/startup/install
+POST /api/startup/uninstall
+POST /api/secret/regenerate
+```
+
+Example authenticated request:
+
+```bash
+curl -H "X-MWBC-Token: paste-secret-here" http://127.0.0.1:45446/api/logs
+```
+
+`POST /api/service/restart` and `POST /api/service/start` can accept a JSON body with `mode`, `backend`, `dashboard_host`, `dashboard_port`, and, for client mode, `host`, `port`, and `retry_seconds`. These endpoints are available only while the dashboard API is already running. If MWBC is stopped, Smith Command Center should launch the MWBC executable/process directly and then reconnect to the API.
+
+`POST /api/secret/regenerate` returns the new `pairing_secret` and updates the live dashboard token list. Smith should save the returned token immediately because future authenticated API calls need the new value.
 
 ## Direct Agent Mode
 
