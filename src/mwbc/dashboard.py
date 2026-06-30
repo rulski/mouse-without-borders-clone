@@ -800,7 +800,7 @@ def render_layout_editor(layout: dict) -> str:
     .device-list { display: grid; gap: 8px; min-height: 72px; }
     .device {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 10px;
       align-items: center;
       min-height: 70px;
@@ -816,6 +816,32 @@ def render_layout_editor(layout: dict) -> str:
     .device.outbound { border-left-color: var(--amber); }
     .device-name { font-weight: 750; overflow-wrap: anywhere; }
     .device-detail { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+    .device-controls {
+      grid-column: 1 / -1;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .feature-row {
+      min-height: 34px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    input[type="checkbox"] { width: 18px; height: 18px; margin: 0; }
+    input[type="number"] {
+      width: 86px;
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 4px 8px;
+      background: var(--panel);
+      color: var(--ink);
+      font: inherit;
+    }
     select {
       min-height: 34px;
       border: 1px solid var(--line);
@@ -902,9 +928,17 @@ def render_layout_editor(layout: dict) -> str:
           name: String(peer.name || ""),
           host: String(peer.host || ""),
           edge: validEdges.includes(peer.edge) ? peer.edge : "right",
-          connected: Boolean(peer.connected)
+          connected: Boolean(peer.connected),
+          keep_awake: Boolean(peer.keep_awake),
+          keep_awake_interval_seconds: normalizeInterval(peer.keep_awake_interval_seconds)
         }))
         .filter((peer) => peer.name);
+    }
+
+    function normalizeInterval(value) {
+      const interval = Number(value);
+      if (!Number.isFinite(interval)) return 45;
+      return Math.min(3600, Math.max(5, Math.round(interval)));
     }
 
     function setStatus(value) {
@@ -943,7 +977,35 @@ def render_layout_editor(layout: dict) -> str:
       }
       select.addEventListener("change", () => setEdge(peer.name, select.value));
 
-      card.append(text, select);
+      const controls = document.createElement("div");
+      controls.className = "device-controls";
+
+      const keepAwakeLabel = document.createElement("label");
+      keepAwakeLabel.className = "feature-row";
+      const keepAwake = document.createElement("input");
+      keepAwake.type = "checkbox";
+      keepAwake.checked = peer.keep_awake;
+      keepAwake.addEventListener("change", () => updateFeature(peer.name, {
+        keep_awake: keepAwake.checked
+      }));
+      keepAwakeLabel.append(keepAwake, document.createTextNode("Keep awake"));
+
+      const intervalLabel = document.createElement("label");
+      intervalLabel.className = "feature-row";
+      const interval = document.createElement("input");
+      interval.type = "number";
+      interval.min = "5";
+      interval.max = "3600";
+      interval.step = "5";
+      interval.value = String(peer.keep_awake_interval_seconds);
+      interval.addEventListener("change", () => updateFeature(peer.name, {
+        keep_awake_interval_seconds: normalizeInterval(interval.value)
+      }));
+      intervalLabel.append(document.createTextNode("Every"), interval, document.createTextNode("sec"));
+
+      controls.append(keepAwakeLabel, intervalLabel);
+
+      card.append(text, select, controls);
       card.addEventListener("dragstart", (event) => {
         draggedName = peer.name;
         event.dataTransfer.effectAllowed = "move";
@@ -977,6 +1039,15 @@ def render_layout_editor(layout: dict) -> str:
       saveLayout();
     }
 
+    function updateFeature(name, updates) {
+      const peer = peers.find((item) => item.name === name);
+      if (!peer) return;
+      Object.assign(peer, updates);
+      peer.keep_awake_interval_seconds = normalizeInterval(peer.keep_awake_interval_seconds);
+      render();
+      saveLayout();
+    }
+
     async function saveLayout() {
       if (!token) {
         setStatus("Missing token");
@@ -991,7 +1062,12 @@ def render_layout_editor(layout: dict) -> str:
             "X-MWBC-Token": token
           },
           body: JSON.stringify({
-            peers: peers.map((peer) => ({ name: peer.name, edge: peer.edge }))
+            peers: peers.map((peer) => ({
+              name: peer.name,
+              edge: peer.edge,
+              keep_awake: peer.keep_awake,
+              keep_awake_interval_seconds: peer.keep_awake_interval_seconds
+            }))
           })
         });
         const result = await response.json();

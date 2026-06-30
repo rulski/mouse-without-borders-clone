@@ -103,6 +103,52 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             await connector.stop()
             await server.stop()
 
+    async def test_host_sends_keep_awake_settings_to_client(self) -> None:
+        host_config = AppConfig(
+            machine_name="host",
+            pairing_secret="secret",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            peers=[
+                PeerConfig(
+                    name="client",
+                    edge="right",
+                    keep_awake=True,
+                    keep_awake_interval_seconds=0.1,
+                )
+            ],
+        )
+        host_backend = NullBackend()
+        host_state = StateStore("host", host_backend.name)
+        host_state.register_peer("client", "", 45445, "right")
+        registry = HostClientRegistry(host_state)
+        server = AgentServer(host_config, host_backend, host_state, host_registry=registry)
+        await server.start()
+        assert server._server is not None
+        port = server._server.sockets[0].getsockname()[1]
+
+        client_config = AppConfig(machine_name="client", pairing_secret="secret")
+        client_backend = NullBackend()
+        client_state = StateStore("client", client_backend.name)
+        connector = ClientConnector(
+            config=client_config,
+            backend=client_backend,
+            state=client_state,
+            host="127.0.0.1",
+            port=port,
+            retry_seconds=0.05,
+        )
+
+        try:
+            await connector.start()
+            await self._wait_for_hosted_client(registry, "client")
+            await self._wait_for_state(client_state, "keep_awake", True)
+            await self._wait_for_state(client_state, "last_keep_awake_at")
+            self.assertEqual(client_backend.current_position(), (960, 540))
+        finally:
+            await connector.stop()
+            await server.stop()
+
     async def _wait_for_hosted_client(self, registry: HostClientRegistry, name: str):
         for _ in range(60):
             client = await registry.get(name)
@@ -117,6 +163,16 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
                 return
             await asyncio.sleep(0.05)
         self.fail(f"clipboard did not become {expected!r}")
+
+    async def _wait_for_state(self, state: StateStore, key: str, expected=None) -> None:
+        for _ in range(60):
+            value = state.snapshot().get(key)
+            if expected is None and value is not None:
+                return
+            if expected is not None and value == expected:
+                return
+            await asyncio.sleep(0.05)
+        self.fail(f"state {key!r} did not become {expected!r}")
 
 
 if __name__ == "__main__":

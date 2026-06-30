@@ -19,6 +19,8 @@ class PeerConfig:
     host: str = ""
     edge: str = "right"
     port: int = DEFAULT_PORT
+    keep_awake: bool = False
+    keep_awake_interval_seconds: float = 45.0
     shared_secret: str | None = None
 
     @classmethod
@@ -37,6 +39,8 @@ class PeerConfig:
             host=host,
             edge=edge,
             port=int(data.get("port", DEFAULT_PORT)),
+            keep_awake=bool(data.get("keep_awake", False)),
+            keep_awake_interval_seconds=float(data.get("keep_awake_interval_seconds", 45.0)),
             shared_secret=data.get("shared_secret") or None,
         )
 
@@ -47,6 +51,12 @@ class PeerConfig:
         if self.shared_secret is None:
             data.pop("shared_secret")
         return data
+
+    def client_settings(self) -> dict[str, Any]:
+        return {
+            "keep_awake": self.keep_awake,
+            "keep_awake_interval_seconds": self.keep_awake_interval_seconds,
+        }
 
 
 @dataclass(slots=True)

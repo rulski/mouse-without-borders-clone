@@ -53,6 +53,7 @@ class DashboardTests(unittest.TestCase):
             self.assertIn("Device Layout", body)
             self.assertIn("/api/layout", body)
             self.assertIn("MACBOOK", body)
+            self.assertIn("Keep awake", body)
         finally:
             server.stop()
 

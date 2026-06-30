@@ -205,6 +205,8 @@ def _build_layout_update_handler(
     config_path: Path,
     state: StateStore,
     controller_ref: dict[str, BorderController | None],
+    host_registry: HostClientRegistry | None,
+    loop: asyncio.AbstractEventLoop,
     layout_lock: threading.RLock,
 ):
     def handle(payload: dict[str, Any]) -> dict[str, Any]:
@@ -212,7 +214,7 @@ def _build_layout_update_handler(
         if not isinstance(requested, list) or not all(isinstance(item, dict) for item in requested):
             raise ValueError("peers must be a list of objects")
 
-        edge_by_name: dict[str, str] = {}
+        updates_by_name: dict[str, dict[str, Any]] = {}
         for item in requested:
             name = str(item.get("name") or "").strip()
             edge = str(item.get("edge") or "").lower().strip()
@@ -220,16 +222,26 @@ def _build_layout_update_handler(
                 raise ValueError("peer is missing a name")
             if edge not in VALID_EDGES:
                 raise ValueError(f"invalid edge {edge!r}; expected one of {sorted(VALID_EDGES)}")
-            edge_by_name[name] = edge
+            interval = float(item.get("keep_awake_interval_seconds", 45.0))
+            if interval < 5 or interval > 3600:
+                raise ValueError("keep-awake interval must be between 5 and 3600 seconds")
+            updates_by_name[name] = {
+                "edge": edge,
+                "keep_awake": bool(item.get("keep_awake", False)),
+                "keep_awake_interval_seconds": interval,
+            }
 
         with layout_lock:
             known = {peer.name: peer for peer in config.peers}
-            unknown = sorted(name for name in edge_by_name if name not in known)
+            unknown = sorted(name for name in updates_by_name if name not in known)
             if unknown:
                 raise ValueError(f"unknown peer: {', '.join(unknown)}")
 
-            for name, edge in edge_by_name.items():
-                known[name].edge = edge
+            for name, updates in updates_by_name.items():
+                peer = known[name]
+                peer.edge = updates["edge"]
+                peer.keep_awake = updates["keep_awake"]
+                peer.keep_awake_interval_seconds = updates["keep_awake_interval_seconds"]
             save_config(config, config_path)
             for peer in config.peers:
                 state.register_peer(peer.name, peer.host, peer.port, peer.edge)
@@ -237,6 +249,13 @@ def _build_layout_update_handler(
         controller = controller_ref.get("controller")
         if controller is not None and controller.loop is not None and controller.loop.is_running():
             future = asyncio.run_coroutine_threadsafe(controller.refresh_peers(), controller.loop)
+            future.result(timeout=2)
+
+        if host_registry is not None and updates_by_name:
+            future = asyncio.run_coroutine_threadsafe(
+                _send_peer_settings(config, host_registry, updates_by_name.keys()),
+                loop,
+            )
             future.result(timeout=2)
 
         with layout_lock:
@@ -260,9 +279,26 @@ def _layout_snapshot(config: AppConfig, state: StateStore) -> dict[str, Any]:
                 "screen_width": status.get("screen_width"),
                 "screen_height": status.get("screen_height"),
                 "error": status.get("error"),
+                "keep_awake": peer.keep_awake,
+                "keep_awake_interval_seconds": peer.keep_awake_interval_seconds,
             }
         )
     return {"machine_name": config.machine_name, "peers": peers}
+
+
+async def _send_peer_settings(config: AppConfig, host_registry: HostClientRegistry, names: Any) -> None:
+    known = {peer.name: peer for peer in config.peers}
+    for name in names:
+        peer = known.get(str(name))
+        if peer is None:
+            continue
+        client = await host_registry.get(peer.name)
+        if client is None:
+            continue
+        try:
+            await client.send("settings", peer.client_settings())
+        except Exception as exc:
+            logging.getLogger(__name__).info("failed to send settings to %s: %s", peer.name, exc)
 
 
 async def cmd_run(args: argparse.Namespace) -> int:
@@ -284,6 +320,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
     dashboard: DashboardServer | None = None
     controller_ref: dict[str, BorderController | None] = {"controller": None}
     layout_lock = threading.RLock()
+    host_registry: HostClientRegistry | None = None
+    if args.command in {"run", "host"}:
+        host_registry = HostClientRegistry(state)
+
     if args.command in {"run", "host"} and not args.no_dashboard:
         dashboard = DashboardServer(
             config.dashboard_host,
@@ -292,7 +332,15 @@ async def cmd_run(args: argparse.Namespace) -> int:
             auth_tokens=config.accepted_secrets(),
             web_input_handler=_build_web_input_handler(backend, state),
             layout_provider=_build_layout_provider(config, state, layout_lock),
-            layout_update_handler=_build_layout_update_handler(config, args.config, state, controller_ref, layout_lock),
+            layout_update_handler=_build_layout_update_handler(
+                config,
+                args.config,
+                state,
+                controller_ref,
+                host_registry,
+                asyncio.get_running_loop(),
+                layout_lock,
+            ),
         )
         dashboard.start()
         print(f"Dashboard: {dashboard.url}")
@@ -302,11 +350,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     agent: AgentServer | None = None
     controller: BorderController | None = None
     connector: ClientConnector | None = None
-    host_registry: HostClientRegistry | None = None
     tasks: list[asyncio.Task] = []
-
-    if args.command in {"run", "host"}:
-        host_registry = HostClientRegistry(state)
 
     if args.command in {"run", "agent", "host"}:
         agent = AgentServer(config, backend, state, host_registry=host_registry, clipboard=clipboard)

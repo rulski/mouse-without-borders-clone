@@ -11,7 +11,8 @@ It is an MVP, not a kernel-level input driver. Native input capture/injection is
 - Agent mode for receiving mouse, keyboard, click, and scroll events.
 - Controller mode that switches to a peer when the pointer hits an edge.
 - Browser controller mode for locked-down devices that can open a web page but cannot run an executable.
-- Host layout editor for moving peer devices to the left, right, top, or bottom edge.
+- Host layout editor for moving peer devices to the left, right, top, or bottom edge and controlling per-client features.
+- Host-controlled keep-awake mode for selected clients.
 - Text clipboard sync from always-looking clients back to the host.
 - Pointer locking while remote control is active so relative motion can continue past the local screen edge.
 - Optional local event suppression while controlling a peer, when supported by the OS/backend.
@@ -80,6 +81,8 @@ Layout editor: http://127.0.0.1:45446/layout#token=...
 ```
 
 Open that URL on the host. Drag devices to the edge where they physically sit, or use each device's edge selector. Changes are saved to `~/.mwbc/config.json` and the running host refreshes immediately.
+
+The host UI is also where client features are controlled. For now, each client has a `Keep awake` checkbox and interval. When enabled, the host sends that setting to the connected client, and the client performs a tiny local mouse nudge at the configured interval so that device stays awake. The nudge pauses while the host is actively controlling that client.
 
 For your layout:
 
@@ -206,13 +209,15 @@ Example:
     {
       "name": "LAPTOP",
       "edge": "right",
-      "port": 45445
+      "port": 45445,
+      "keep_awake": false,
+      "keep_awake_interval_seconds": 45.0
     }
   ]
 }
 ```
 
-For always-looking clients, `host` can be omitted. For direct agent mode, set `host` to the client's IP or DNS name. You can set `shared_secret` on a peer if you want a different secret for that specific machine.
+For always-looking clients, `host` can be omitted. For direct agent mode, set `host` to the client's IP or DNS name. You can set `shared_secret` on a peer if you want a different secret for that specific machine. Per-peer feature settings, such as `keep_awake`, are owned by the host config and pushed to clients when they connect or when you save the host UI.
 
 ## Commands
 

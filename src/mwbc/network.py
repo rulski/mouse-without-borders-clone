@@ -291,6 +291,7 @@ class AgentServer:
                     state=self.state,
                 )
                 await self.host_registry.register(hosted_client)
+                await self._send_client_settings(hosted_client)
                 await self._monitor_hosted_client(hosted_client, incoming_key)
                 return
 
@@ -348,6 +349,17 @@ class AgentServer:
         await asyncio.to_thread(self.clipboard.set_text, text)
         self.state.update(last_clipboard_source=source, last_clipboard_at=time.time())
 
+    async def _send_client_settings(self, client: HostedRemoteClient) -> None:
+        settings = {
+            "keep_awake": False,
+            "keep_awake_interval_seconds": 45.0,
+        }
+        for peer in self.config.peers:
+            if peer.name == client.name:
+                settings = peer.client_settings()
+                break
+        await client.send("settings", settings)
+
 
 class ClientConnector:
     def __init__(
@@ -369,6 +381,10 @@ class ClientConnector:
         self.clipboard = clipboard
         self._running = False
         self._task: asyncio.Task[None] | None = None
+        self._host_active = False
+        self._keep_awake = False
+        self._keep_awake_interval_seconds = 45.0
+        self._settings_changed = asyncio.Event()
 
     async def start(self) -> None:
         if self._task is not None:
@@ -425,6 +441,7 @@ class ClientConnector:
         )
         heartbeat_task = asyncio.create_task(self._send_heartbeats(writer, secret), name="mwbc-client-heartbeat")
         clipboard_task: asyncio.Task[None] | None = None
+        keep_awake_task = asyncio.create_task(self._keep_awake_loop(), name="mwbc-client-keep-awake")
         if self.clipboard is not None and self.config.clipboard_enabled:
             clipboard_task = asyncio.create_task(
                 self._send_clipboard_changes(writer, secret),
@@ -442,15 +459,37 @@ class ClientConnector:
                 clipboard_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await clipboard_task
+            keep_awake_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await keep_awake_task
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
-            self.state.update(host_connected=False)
+            self._host_active = False
+            self.state.update(host_connected=False, host_active=False)
 
     async def _send_heartbeats(self, writer: asyncio.StreamWriter, secret: str) -> None:
         while self._running and not writer.is_closing():
             await asyncio.sleep(3)
             await send_message(writer, "heartbeat", {}, secret)
+
+    async def _keep_awake_loop(self) -> None:
+        while self._running:
+            try:
+                await asyncio.wait_for(
+                    self._settings_changed.wait(),
+                    timeout=max(0.1, self._keep_awake_interval_seconds),
+                )
+                self._settings_changed.clear()
+                continue
+            except asyncio.TimeoutError:
+                pass
+            if not self._keep_awake or self._host_active:
+                continue
+            self.backend.move_relative(1, 0)
+            await asyncio.sleep(0.05)
+            self.backend.move_relative(-1, 0)
+            self.state.update(last_keep_awake_at=time.time())
 
     async def _send_clipboard_changes(self, writer: asyncio.StreamWriter, secret: str) -> None:
         assert self.clipboard is not None
@@ -485,13 +524,26 @@ class ClientConnector:
             apply_input_event(self.backend, message.payload)
             self.state.increment("events_received")
         elif message.type == "control":
-            self.state.update(host_active=message.payload.get("active"))
+            self._host_active = bool(message.payload.get("active"))
+            self.state.update(host_active=self._host_active)
         elif message.type == "clipboard":
             if self.clipboard is not None and self.config.clipboard_enabled:
                 text = truncate_text(str(message.payload.get("text", "")), self.config.clipboard_max_text_bytes)
                 await asyncio.to_thread(self.clipboard.set_text, text)
                 self.state.update(last_clipboard_received=time.time())
+        elif message.type == "settings":
+            self._apply_settings(message.payload)
         elif message.type == "heartbeat":
             return
         else:
             logger.warning("ignoring unknown host message type %s", message.type)
+
+    def _apply_settings(self, payload: dict[str, Any]) -> None:
+        interval = float(payload.get("keep_awake_interval_seconds", 45.0))
+        self._keep_awake = bool(payload.get("keep_awake", False))
+        self._keep_awake_interval_seconds = min(3600.0, max(0.1, interval))
+        self.state.update(
+            keep_awake=self._keep_awake,
+            keep_awake_interval_seconds=self._keep_awake_interval_seconds,
+        )
+        self._settings_changed.set()
