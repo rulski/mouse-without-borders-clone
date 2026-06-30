@@ -103,6 +103,60 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             await connector.stop()
             await server.stop()
 
+    async def test_host_sends_clipboard_to_always_looking_client(self) -> None:
+        host_config = AppConfig(
+            machine_name="host",
+            pairing_secret="secret",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            clipboard_poll_seconds=0.05,
+            peers=[PeerConfig(name="client", edge="right")],
+        )
+        host_backend = NullBackend()
+        host_clipboard = NullClipboard("initial host")
+        host_state = StateStore("host", host_backend.name)
+        host_state.register_peer("client", "", 45445, "right")
+        registry = HostClientRegistry(host_state)
+        server = AgentServer(
+            host_config,
+            host_backend,
+            host_state,
+            host_registry=registry,
+            clipboard=host_clipboard,
+        )
+        await server.start()
+        assert server._server is not None
+        port = server._server.sockets[0].getsockname()[1]
+
+        client_config = AppConfig(
+            machine_name="client",
+            pairing_secret="secret",
+            clipboard_poll_seconds=0.05,
+        )
+        client_backend = NullBackend()
+        client_clipboard = NullClipboard("initial client")
+        client_state = StateStore("client", client_backend.name)
+        connector = ClientConnector(
+            config=client_config,
+            backend=client_backend,
+            state=client_state,
+            host="127.0.0.1",
+            port=port,
+            retry_seconds=0.05,
+            clipboard=client_clipboard,
+        )
+
+        try:
+            await connector.start()
+            await self._wait_for_hosted_client(registry, "client")
+            host_clipboard.set_text("copied from host")
+            await self._wait_for_clipboard(client_clipboard, "copied from host")
+            await asyncio.sleep(0.2)
+            self.assertEqual(host_state.snapshot().get("last_clipboard_source"), "host")
+        finally:
+            await connector.stop()
+            await server.stop()
+
     async def test_host_sends_keep_awake_settings_to_client(self) -> None:
         host_config = AppConfig(
             machine_name="host",

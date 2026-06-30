@@ -13,7 +13,7 @@ It is an MVP, not a kernel-level input driver. Native input capture/injection is
 - Browser controller mode for locked-down devices that can open a web page but cannot run an executable.
 - Host layout editor for moving peer devices to the left, right, top, or bottom edge and controlling per-client features.
 - Host-controlled keep-awake mode for selected clients.
-- Text clipboard sync from always-looking clients back to the host.
+- Bidirectional text clipboard sync between the host and always-looking clients.
 - Pointer locking while remote control is active so relative motion can continue past the local screen edge.
 - Optional local event suppression while controlling a peer, when supported by the OS/backend.
 - Small local dashboard at `http://127.0.0.1:45446`.
@@ -68,7 +68,7 @@ Replace `192.168.1.10` with the host machine's LAN IP or DNS name. The client ke
 
 Move the host machine's pointer into a configured edge. For example, `--edge right` means the client is logically to the right of the host screen. Move left on the remote screen edge to return to the host.
 
-When a connected client copies plain text, the client sends that text to the host clipboard. For example, text copied on `MACBOOK` can be pasted back on the Windows host.
+When a connected host or client copies plain text, MWBC syncs that text to the other side. For example, text copied on `MACBOOK` can be pasted on the Windows host, and text copied on the Windows host can be pasted on `MACBOOK`.
 
 Press `F12` on the host to toggle host lock. When host lock is on, edge switching is paused so the mouse and keyboard stay on the host. If you press `F12` while controlling a client, MWBC returns control to the host immediately. Press `F12` again to resume edge switching.
 
@@ -296,4 +296,4 @@ mwbc run --backend null
 - Open TCP port `45445` between machines.
 - Open TCP port `45446` when using browser controller mode from another device.
 - Keep the dashboard bound to `127.0.0.1` unless you intentionally want it reachable from the LAN.
-- Clipboard sync, file drag/drop, auto-discovery, and per-monitor geometry are natural next additions.
+- File drag/drop, auto-discovery, and per-monitor geometry are natural next additions.

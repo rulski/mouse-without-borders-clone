@@ -196,6 +196,11 @@ class HostClientRegistry:
             return client
         return None
 
+    async def connected_clients(self) -> list[HostedRemoteClient]:
+        async with self._lock:
+            clients = list(self._clients.values())
+        return [client for client in clients if client.connected]
+
     async def close_all(self) -> None:
         async with self._lock:
             clients = list(self._clients.values())
@@ -219,11 +224,23 @@ class AgentServer:
         self.host_registry = host_registry
         self.clipboard = clipboard
         self._server: asyncio.AbstractServer | None = None
+        self._clipboard_task: asyncio.Task[None] | None = None
+        self._clipboard_last_seen: str | None = None
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_client, self.config.listen_host, self.config.listen_port)
         sockets = ", ".join(str(sock.getsockname()) for sock in (self._server.sockets or []))
         logger.info("agent listening on %s", sockets)
+        if (
+            self.host_registry is not None
+            and self.clipboard is not None
+            and self.config.clipboard_enabled
+            and self._clipboard_task is None
+        ):
+            self._clipboard_task = asyncio.create_task(
+                self._send_host_clipboard_changes(),
+                name="mwbc-host-clipboard",
+            )
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -233,6 +250,11 @@ class AgentServer:
             await self._server.serve_forever()
 
     async def stop(self) -> None:
+        if self._clipboard_task is not None:
+            self._clipboard_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._clipboard_task
+            self._clipboard_task = None
         if self._server is None:
             return
         self._server.close()
@@ -347,7 +369,60 @@ class AgentServer:
 
         text = truncate_text(str(message.payload["text"]), self.config.clipboard_max_text_bytes)
         await asyncio.to_thread(self.clipboard.set_text, text)
+        self._clipboard_last_seen = text
         self.state.update(last_clipboard_source=source, last_clipboard_at=time.time())
+        await self._broadcast_clipboard(text, exclude=source)
+
+    async def _send_host_clipboard_changes(self) -> None:
+        assert self.clipboard is not None
+        try:
+            self._clipboard_last_seen = truncate_text(
+                await self._read_clipboard_text(),
+                self.config.clipboard_max_text_bytes,
+            )
+        except ClipboardError as exc:
+            self._clipboard_last_seen = ""
+            self.state.update(clipboard_error=str(exc))
+
+        while True:
+            await asyncio.sleep(max(0.1, self.config.clipboard_poll_seconds))
+            try:
+                text = truncate_text(
+                    await self._read_clipboard_text(),
+                    self.config.clipboard_max_text_bytes,
+                )
+            except ClipboardError as exc:
+                self.state.update(clipboard_error=str(exc))
+                continue
+            if text == self._clipboard_last_seen:
+                continue
+            self._clipboard_last_seen = text
+            await self._broadcast_clipboard(text)
+            self.state.update(
+                clipboard_error=None,
+                last_clipboard_source=self.config.machine_name,
+                last_clipboard_sent=time.time(),
+            )
+
+    async def _read_clipboard_text(self) -> str:
+        assert self.clipboard is not None
+        return await asyncio.to_thread(self.clipboard.get_text)
+
+    async def _broadcast_clipboard(self, text: str, *, exclude: str | None = None) -> None:
+        if self.host_registry is None or not self.config.clipboard_enabled:
+            return
+        payload = {
+            "source": self.config.machine_name,
+            "text": truncate_text(text, self.config.clipboard_max_text_bytes),
+        }
+        for client in await self.host_registry.connected_clients():
+            if exclude is not None and client.name == exclude:
+                continue
+            try:
+                await client.send("clipboard", payload)
+            except Exception as exc:
+                logger.info("failed to send clipboard to %s: %s", client.name, exc)
+                self.state.update_peer(client.name, error=str(exc))
 
     async def _send_client_settings(self, client: HostedRemoteClient) -> None:
         settings = {
@@ -385,6 +460,7 @@ class ClientConnector:
         self._keep_awake = False
         self._keep_awake_interval_seconds = 45.0
         self._settings_changed = asyncio.Event()
+        self._clipboard_last_seen: str | None = None
 
     async def start(self) -> None:
         if self._task is not None:
@@ -494,9 +570,12 @@ class ClientConnector:
     async def _send_clipboard_changes(self, writer: asyncio.StreamWriter, secret: str) -> None:
         assert self.clipboard is not None
         try:
-            last_text = await self._read_clipboard_text()
+            self._clipboard_last_seen = truncate_text(
+                await self._read_clipboard_text(),
+                self.config.clipboard_max_text_bytes,
+            )
         except ClipboardError as exc:
-            last_text = ""
+            self._clipboard_last_seen = ""
             self.state.update(clipboard_error=str(exc))
         while self._running and not writer.is_closing():
             await asyncio.sleep(max(0.1, self.config.clipboard_poll_seconds))
@@ -505,12 +584,13 @@ class ClientConnector:
             except ClipboardError as exc:
                 self.state.update(clipboard_error=str(exc))
                 continue
-            if text == last_text:
+            text = truncate_text(text, self.config.clipboard_max_text_bytes)
+            if text == self._clipboard_last_seen:
                 continue
-            last_text = text
+            self._clipboard_last_seen = text
             payload = {
                 "source": self.config.machine_name,
-                "text": truncate_text(text, self.config.clipboard_max_text_bytes),
+                "text": text,
             }
             await send_message(writer, "clipboard", payload, secret)
             self.state.update(clipboard_error=None, last_clipboard_sent=time.time())
@@ -530,6 +610,7 @@ class ClientConnector:
             if self.clipboard is not None and self.config.clipboard_enabled:
                 text = truncate_text(str(message.payload.get("text", "")), self.config.clipboard_max_text_bytes)
                 await asyncio.to_thread(self.clipboard.set_text, text)
+                self._clipboard_last_seen = text
                 self.state.update(last_clipboard_received=time.time())
         elif message.type == "settings":
             self._apply_settings(message.payload)
