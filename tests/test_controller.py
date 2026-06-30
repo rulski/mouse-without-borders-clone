@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from mwbc.config import AppConfig, PeerConfig
 from mwbc.controller import ActiveRemote, BorderController
+from mwbc.geometry import Point
 from mwbc.input_backend import NullBackend
 from mwbc.state import StateStore
 
@@ -104,6 +105,43 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(backend.capture_modes[-1])
         finally:
             await controller.stop()
+
+    async def test_host_lock_hotkey_pauses_edge_switching(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        config = AppConfig(machine_name="host", peers=[peer])
+        backend = TrackingBackend()
+        state = StateStore("host", backend.name)
+        controller = BorderController(config, backend, state)
+
+        handled = await controller._handle_host_lock_hotkey({"kind": "special", "value": "f12"}, pressed=True)
+        await controller._maybe_activate(Point(0, 500))
+
+        self.assertTrue(handled)
+        self.assertTrue(controller.edge_switching_paused)
+        self.assertIsNone(controller.active)
+        self.assertTrue(state.snapshot()["edge_switching_paused"])
+
+    async def test_host_lock_hotkey_returns_from_active_remote_without_disconnect(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        config = AppConfig(machine_name="host", peers=[peer])
+        backend = TrackingBackend()
+        state = StateStore("host", backend.name)
+        controller = BorderController(config, backend, state)
+        client = FakeRemoteClient(connected=True)
+        controller.active = ActiveRemote(peer=peer, client=client, point=SimpleNamespace(x=5, y=5))
+        state.update(active_peer="mac")
+        state.update_peer("mac", connected=True, error=None)
+        controller._start_capture(suppress=True)
+
+        await controller._handle_host_lock_hotkey({"kind": "special", "value": "f12"}, pressed=True)
+
+        peer_state = state.snapshot()["peers"][0]
+        self.assertTrue(controller.edge_switching_paused)
+        self.assertIsNone(controller.active)
+        self.assertIsNone(state.snapshot()["active_peer"])
+        self.assertTrue(peer_state["connected"])
+        self.assertIsNone(peer_state["error"])
+        self.assertEqual(backend.capture_modes[-2:], [True, False])
 
 
 if __name__ == "__main__":

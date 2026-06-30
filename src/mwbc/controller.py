@@ -13,6 +13,7 @@ from .network import HostClientRegistry, RemoteClient
 from .state import StateStore
 
 logger = logging.getLogger(__name__)
+HOST_LOCK_HOTKEY = "F12"
 
 
 @dataclass(slots=True)
@@ -47,10 +48,16 @@ class BorderController:
         self._reconnect_task: asyncio.Task[None] | None = None
         self._active_watch_task: asyncio.Task[None] | None = None
         self._ignore_next_lock_motion = False
+        self.edge_switching_paused = False
 
         for peer in config.peers:
             state.register_peer(peer.name, peer.host, peer.port, peer.edge)
-        state.update(local_screen_width=self.local_size.width, local_screen_height=self.local_size.height)
+        state.update(
+            local_screen_width=self.local_size.width,
+            local_screen_height=self.local_size.height,
+            edge_switching_paused=self.edge_switching_paused,
+            host_lock_hotkey=HOST_LOCK_HOTKEY,
+        )
 
     async def start(self) -> None:
         self.loop = asyncio.get_running_loop()
@@ -113,8 +120,12 @@ class BorderController:
                 elif event_type == "scroll":
                     await self._handle_scroll(int(values[2]), int(values[3]))
                 elif event_type == "key_press":
+                    if await self._handle_host_lock_hotkey(values[0], pressed=True):
+                        continue
                     await self._send_key("key_press", values[0])
                 elif event_type == "key_release":
+                    if await self._handle_host_lock_hotkey(values[0], pressed=False):
+                        continue
                     await self._send_key("key_release", values[0])
             except Exception as exc:
                 logger.exception("controller event failed")
@@ -142,21 +153,41 @@ class BorderController:
                 await self._recover_local(f"{active.peer.name} disconnected")
 
     async def _recover_local(self, reason: str) -> None:
+        await self._return_local(reason, mark_disconnected=True)
+
+    async def _return_local(self, reason: str, *, mark_disconnected: bool) -> None:
         active = self.active
         if active is None:
-            self.state.set_error(reason)
             self.state.update(active_peer=None)
+            if mark_disconnected:
+                self.state.set_error(reason)
             return
 
         self.active = None
         self.state.update(active_peer=None)
-        self.state.update_peer(active.peer.name, connected=False, error=reason)
-        self.state.set_error(f"{active.peer.name}: {reason}")
+        if mark_disconnected:
+            self.state.update_peer(active.peer.name, connected=False, error=reason)
+            self.state.set_error(f"{active.peer.name}: {reason}")
         if self.config.suppress_local_events_when_remote:
             self._start_capture(suppress=False)
         self.backend.move_to(self.lock_point.x, self.lock_point.y)
         self._ignore_next_lock_motion = True
         logger.info("returned control to local host after remote failure: %s", reason)
+
+    async def _handle_host_lock_hotkey(self, key: dict[str, str], *, pressed: bool) -> bool:
+        if not _is_host_lock_hotkey(key):
+            return False
+        if pressed:
+            await self._toggle_edge_switching_pause()
+        return True
+
+    async def _toggle_edge_switching_pause(self) -> None:
+        self.edge_switching_paused = not self.edge_switching_paused
+        self.state.update(edge_switching_paused=self.edge_switching_paused)
+        if self.edge_switching_paused:
+            await self._return_local("host lock hotkey pressed", mark_disconnected=False)
+        else:
+            self.state.set_error(None)
 
     async def _handle_move(self, x: int, y: int) -> None:
         if self.active is None:
@@ -189,6 +220,9 @@ class BorderController:
         self._ignore_next_lock_motion = True
 
     async def _maybe_activate(self, point: Point) -> None:
+        if self.edge_switching_paused:
+            return
+
         for peer in self.config.peers:
             if not should_activate(peer.edge, point, self.local_size, self.config.edge_threshold_px):
                 continue
@@ -260,3 +294,7 @@ class BorderController:
             return
         await self.active.client.send("input", {"action": action, "key": key})
         self.state.increment("events_forwarded")
+
+
+def _is_host_lock_hotkey(key: dict[str, str]) -> bool:
+    return key.get("kind") == "special" and str(key.get("value", "")).lower() == "f12"

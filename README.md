@@ -69,6 +69,8 @@ Move the host machine's pointer into a configured edge. For example, `--edge rig
 
 When a connected client copies plain text, the client sends that text to the host clipboard. For example, text copied on `MACBOOK` can be pasted back on the Windows host.
 
+Press `F12` on the host to toggle host lock. When host lock is on, edge switching is paused so the mouse and keyboard stay on the host. If you press `F12` while controlling a client, MWBC returns control to the host immediately. Press `F12` again to resume edge switching.
+
 ## Layout Editor
 
 When the host starts with the dashboard enabled, it prints a URL like:
