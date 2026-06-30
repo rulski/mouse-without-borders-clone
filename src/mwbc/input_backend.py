@@ -37,6 +37,7 @@ SHIFTED_SYMBOL_TO_BASE = {
     ">": ".",
     "?": "/",
 }
+BASE_TO_SHIFTED_SYMBOL = {base: shifted for shifted, base in SHIFTED_SYMBOL_TO_BASE.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +137,8 @@ class PynputBackend:
         self._mouse_listener: Any = None
         self._keyboard_listener: Any = None
         self._shift_down = False
+        self._replay_shift_keys: set[str] = set()
+        self._replay_one_shot_chars: set[str] = set()
 
     def screen_size(self) -> tuple[int, int]:
         if sys.platform.startswith("win"):
@@ -180,9 +183,32 @@ class PynputBackend:
         self._mouse_controller.scroll(int(dx), int(dy))
 
     def key_press(self, key: dict[str, str]) -> None:
+        if _is_shift_wire(key):
+            self._replay_shift_keys.add(_shift_wire_value(key))
+            self._keyboard_controller.press(self._key_from_wire(key))
+            return
+
+        one_shot = self._shifted_symbol_for_replay(key)
+        if one_shot is not None:
+            self._replay_one_shot_chars.add(str(key.get("value", "")))
+            self._tap_text_key(one_shot)
+            return
+
         self._keyboard_controller.press(self._key_from_wire(key))
 
     def key_release(self, key: dict[str, str]) -> None:
+        if _is_shift_wire(key):
+            try:
+                self._keyboard_controller.release(self._key_from_wire(key))
+            finally:
+                self._replay_shift_keys.discard(_shift_wire_value(key))
+            return
+
+        value = str(key.get("value", ""))
+        if key.get("kind") == "char" and value in self._replay_one_shot_chars:
+            self._replay_one_shot_chars.discard(value)
+            return
+
         self._keyboard_controller.release(self._key_from_wire(key))
 
     def start_capture(self, callbacks: CaptureCallbacks, *, suppress: bool) -> None:
@@ -259,11 +285,30 @@ class PynputBackend:
         value = key.get("value", "")
         return getattr(self._keyboard_module.Key, value, value)
 
+    def _shifted_symbol_for_replay(self, key: dict[str, str]) -> str | None:
+        if key.get("kind") != "char" or not self._replay_shift_keys:
+            return None
+        return BASE_TO_SHIFTED_SYMBOL.get(str(key.get("value", "")))
+
+    def _tap_text_key(self, char: str) -> None:
+        released_shifts = [self._key_from_wire({"kind": "special", "value": value}) for value in self._replay_shift_keys]
+        for shift_key in released_shifts:
+            self._keyboard_controller.release(shift_key)
+        self._keyboard_controller.press(char)
+        self._keyboard_controller.release(char)
+        for shift_key in released_shifts:
+            self._keyboard_controller.press(shift_key)
+
 
 def _is_shift_wire(key: dict[str, str]) -> bool:
     if key.get("kind") != "special":
         return False
     return str(key.get("value", "")).lower() in {"shift", "shift_l", "shift_r"}
+
+
+def _shift_wire_value(key: dict[str, str]) -> str:
+    value = str(key.get("value", "shift")).lower()
+    return value or "shift"
 
 
 def create_backend(kind: str) -> InputBackend:
