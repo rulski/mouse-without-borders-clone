@@ -14,6 +14,31 @@ MouseScrollCallback = Callable[[int, int, int, int], None]
 KeyCallback = Callable[[dict[str, str]], None]
 
 
+SHIFTED_SYMBOL_TO_BASE = {
+    "~": "`",
+    "!": "1",
+    "@": "2",
+    "#": "3",
+    "$": "4",
+    "%": "5",
+    "^": "6",
+    "&": "7",
+    "*": "8",
+    "(": "9",
+    ")": "0",
+    "_": "-",
+    "+": "=",
+    "{": "[",
+    "}": "]",
+    "|": "\\",
+    ":": ";",
+    '"': "'",
+    "<": ",",
+    ">": ".",
+    "?": "/",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class CaptureCallbacks:
     on_move: MouseMoveCallback
@@ -110,6 +135,7 @@ class PynputBackend:
         self._keyboard_controller = keyboard.Controller()
         self._mouse_listener: Any = None
         self._keyboard_listener: Any = None
+        self._shift_down = False
 
     def screen_size(self) -> tuple[int, int]:
         if sys.platform.startswith("win"):
@@ -172,10 +198,16 @@ class PynputBackend:
             callbacks.on_scroll(int(x), int(y), int(dx), int(dy))
 
         def on_press(key: Any) -> None:
-            callbacks.on_key_press(self._key_to_wire(key))
+            wire = self._key_to_wire(key)
+            if _is_shift_wire(wire):
+                self._shift_down = True
+            callbacks.on_key_press(wire)
 
         def on_release(key: Any) -> None:
-            callbacks.on_key_release(self._key_to_wire(key))
+            wire = self._key_to_wire(key)
+            callbacks.on_key_release(wire)
+            if _is_shift_wire(wire):
+                self._shift_down = False
 
         self._mouse_listener = self._mouse_module.Listener(
             on_move=on_move,
@@ -213,6 +245,8 @@ class PynputBackend:
     def _key_to_wire(self, key: Any) -> dict[str, str]:
         char = getattr(key, "char", None)
         if char:
+            if self._shift_down:
+                char = SHIFTED_SYMBOL_TO_BASE.get(char, char)
             return {"kind": "char", "value": char}
         name = str(key)
         if name.startswith("Key."):
@@ -224,6 +258,12 @@ class PynputBackend:
             return key.get("value", "")
         value = key.get("value", "")
         return getattr(self._keyboard_module.Key, value, value)
+
+
+def _is_shift_wire(key: dict[str, str]) -> bool:
+    if key.get("kind") != "special":
+        return False
+    return str(key.get("value", "")).lower() in {"shift", "shift_l", "shift_r"}
 
 
 def create_backend(kind: str) -> InputBackend:
