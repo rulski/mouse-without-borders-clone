@@ -16,11 +16,24 @@ from .state import StateStore
 logger = logging.getLogger(__name__)
 
 MessageHandler = Callable[[Message, str], Awaitable[None]]
+CONNECT_TIMEOUT_SECONDS = 10.0
+HEARTBEAT_INTERVAL_SECONDS = 3.0
+HEARTBEAT_SEND_TIMEOUT_SECONDS = 5.0
 
 
-async def send_message(writer: asyncio.StreamWriter, message_type: str, payload: dict[str, Any], secret: str) -> None:
+async def send_message(
+    writer: asyncio.StreamWriter,
+    message_type: str,
+    payload: dict[str, Any],
+    secret: str,
+    *,
+    timeout: float | None = None,
+) -> None:
     writer.write(encode_message(message_type, payload, secret))
-    await writer.drain()
+    if timeout is None:
+        await writer.drain()
+    else:
+        await asyncio.wait_for(writer.drain(), timeout=timeout)
 
 
 async def read_message(reader: asyncio.StreamReader, secret: str) -> Message:
@@ -489,7 +502,10 @@ class ClientConnector:
                 await asyncio.sleep(self.retry_seconds)
 
     async def _connect_once(self) -> None:
-        reader, writer = await asyncio.open_connection(self.host, self.port)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(self.host, self.port),
+            timeout=CONNECT_TIMEOUT_SECONDS,
+        )
         secret = self.config.pairing_secret
         width, height = self.backend.screen_size()
         await send_message(
@@ -504,7 +520,7 @@ class ClientConnector:
             },
             secret,
         )
-        ack = await read_message(reader, secret)
+        ack = await asyncio.wait_for(read_message(reader, secret), timeout=CONNECT_TIMEOUT_SECONDS)
         if ack.type != "hello_ack":
             raise ConnectionError(f"expected hello_ack, got {ack.type!r}")
 
@@ -515,6 +531,7 @@ class ClientConnector:
             host_screen_width=ack.payload.get("screen_width"),
             host_screen_height=ack.payload.get("screen_height"),
         )
+        host_read_task = asyncio.create_task(self._read_host_messages(reader, secret), name="mwbc-client-host-reader")
         heartbeat_task = asyncio.create_task(self._send_heartbeats(writer, secret), name="mwbc-client-heartbeat")
         clipboard_task: asyncio.Task[None] | None = None
         keep_awake_task = asyncio.create_task(self._keep_awake_loop(), name="mwbc-client-keep-awake")
@@ -523,18 +540,19 @@ class ClientConnector:
                 self._send_clipboard_changes(writer, secret),
                 name="mwbc-client-clipboard",
             )
+        connection_tasks: list[asyncio.Task[None]] = [host_read_task, heartbeat_task]
+        if clipboard_task is not None:
+            connection_tasks.append(clipboard_task)
         try:
-            while self._running:
-                message = await read_message(reader, secret)
-                await self._handle_host_message(message)
+            done, _ = await asyncio.wait(connection_tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+            raise ConnectionError("connection task ended")
         finally:
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
-            if clipboard_task is not None:
-                clipboard_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await clipboard_task
+            for task in connection_tasks:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
             keep_awake_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await keep_awake_task
@@ -544,10 +562,15 @@ class ClientConnector:
             self._host_active = False
             self.state.update(host_connected=False, host_active=False)
 
+    async def _read_host_messages(self, reader: asyncio.StreamReader, secret: str) -> None:
+        while self._running:
+            message = await read_message(reader, secret)
+            await self._handle_host_message(message)
+
     async def _send_heartbeats(self, writer: asyncio.StreamWriter, secret: str) -> None:
         while self._running and not writer.is_closing():
-            await asyncio.sleep(3)
-            await send_message(writer, "heartbeat", {}, secret)
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            await send_message(writer, "heartbeat", {}, secret, timeout=HEARTBEAT_SEND_TIMEOUT_SECONDS)
 
     async def _keep_awake_loop(self) -> None:
         while self._running:

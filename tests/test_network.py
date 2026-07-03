@@ -157,6 +157,50 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             await connector.stop()
             await server.stop()
 
+    async def test_client_connection_exits_when_heartbeat_fails(self) -> None:
+        host_config = AppConfig(
+            machine_name="host",
+            pairing_secret="secret",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            peers=[PeerConfig(name="client", edge="right")],
+        )
+        host_backend = NullBackend()
+        host_state = StateStore("host", host_backend.name)
+        host_state.register_peer("client", "", 45445, "right")
+        registry = HostClientRegistry(host_state)
+        server = AgentServer(host_config, host_backend, host_state, host_registry=registry)
+        await server.start()
+        assert server._server is not None
+        port = server._server.sockets[0].getsockname()[1]
+
+        client_config = AppConfig(machine_name="client", pairing_secret="secret")
+        client_backend = NullBackend()
+        client_state = StateStore("client", client_backend.name)
+        connector = ClientConnector(
+            config=client_config,
+            backend=client_backend,
+            state=client_state,
+            host="127.0.0.1",
+            port=port,
+            retry_seconds=0.05,
+        )
+
+        async def fail_heartbeats(writer, secret) -> None:
+            await asyncio.sleep(0.01)
+            raise ConnectionError("heartbeat failed")
+
+        connector._running = True
+        connector._send_heartbeats = fail_heartbeats  # type: ignore[method-assign]
+
+        try:
+            with self.assertRaisesRegex(ConnectionError, "heartbeat failed"):
+                await asyncio.wait_for(connector._connect_once(), timeout=1)
+            self.assertFalse(client_state.snapshot()["host_connected"])
+        finally:
+            connector._running = False
+            await server.stop()
+
     async def test_host_sends_keep_awake_settings_to_client(self) -> None:
         host_config = AppConfig(
             machine_name="host",
