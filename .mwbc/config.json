@@ -1,0 +1,15 @@
+{
+  "machine_name": "LOCAL",
+  "pairing_secret": "UX1XBSkAjJu8xckSz7YKZdcLShxfADF3aZvtB2_gkPk",
+  "listen_host": "0.0.0.0",
+  "listen_port": 45445,
+  "dashboard_host": "127.0.0.1",
+  "dashboard_port": 45446,
+  "backend": "auto",
+  "clipboard_enabled": true,
+  "clipboard_poll_seconds": 0.5,
+  "clipboard_max_text_bytes": 262144,
+  "suppress_local_events_when_remote": true,
+  "edge_threshold_px": 2,
+  "peers": []
+}
