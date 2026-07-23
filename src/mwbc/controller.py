@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,7 @@ from .state import StateStore
 
 logger = logging.getLogger(__name__)
 HOST_LOCK_HOTKEY = "F12"
+LOCK_MOTION_DROP_SECONDS = 0.2
 
 
 @dataclass(slots=True)
@@ -48,6 +50,7 @@ class BorderController:
         self._reconnect_task: asyncio.Task[None] | None = None
         self._active_watch_task: asyncio.Task[None] | None = None
         self._ignore_next_lock_motion = False
+        self._ignore_lock_motion_until = 0.0
         self.edge_switching_paused = False
 
         for peer in config.peers:
@@ -170,8 +173,7 @@ class BorderController:
             self.state.set_error(f"{active.peer.name}: {reason}")
         if self.config.suppress_local_events_when_remote:
             self._start_capture(suppress=False)
-        self.backend.move_to(self.lock_point.x, self.lock_point.y)
-        self._ignore_next_lock_motion = True
+        self._lock_local_pointer()
         logger.info("returned control to local host after remote failure: %s", reason)
 
     async def _handle_host_lock_hotkey(self, key: dict[str, str], *, pressed: bool) -> bool:
@@ -194,9 +196,15 @@ class BorderController:
             await self._maybe_activate(Point(x, y))
             return
 
-        if self._ignore_next_lock_motion and abs(x - self.lock_point.x) <= 1 and abs(y - self.lock_point.y) <= 1:
+        if self._ignore_next_lock_motion:
+            if self._is_lock_point(Point(x, y)):
+                self._ignore_next_lock_motion = False
+                self._ignore_lock_motion_until = 0.0
+                return
+            if time.monotonic() <= self._ignore_lock_motion_until:
+                return
             self._ignore_next_lock_motion = False
-            return
+            self._ignore_lock_motion_until = 0.0
 
         delta = Point(x - self.lock_point.x, y - self.lock_point.y)
         if delta.x == 0 and delta.y == 0:
@@ -216,8 +224,7 @@ class BorderController:
         active.point = next_point
         await active.client.send("input", {"action": "move", "x": next_point.x, "y": next_point.y})
         self.state.increment("events_forwarded")
-        self.backend.move_to(self.lock_point.x, self.lock_point.y)
-        self._ignore_next_lock_motion = True
+        self._lock_local_pointer()
 
     async def _maybe_activate(self, point: Point) -> None:
         if self.edge_switching_paused:
@@ -241,11 +248,18 @@ class BorderController:
             await client.send("control", {"active": True})
             await client.send("input", {"action": "move", "x": remote_point.x, "y": remote_point.y})
             self.state.increment("events_forwarded")
-            self.backend.move_to(self.lock_point.x, self.lock_point.y)
-            self._ignore_next_lock_motion = True
+            self._lock_local_pointer()
             if self.config.suppress_local_events_when_remote:
                 self._start_capture(suppress=True)
             return
+
+    def _lock_local_pointer(self) -> None:
+        self.backend.move_to(self.lock_point.x, self.lock_point.y)
+        self._ignore_next_lock_motion = True
+        self._ignore_lock_motion_until = time.monotonic() + LOCK_MOTION_DROP_SECONDS
+
+    def _is_lock_point(self, point: Point) -> bool:
+        return abs(point.x - self.lock_point.x) <= 1 and abs(point.y - self.lock_point.y) <= 1
 
     async def _resolve_client(self, peer: PeerConfig) -> object:
         if self.host_registry is not None:

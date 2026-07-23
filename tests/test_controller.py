@@ -143,6 +143,38 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(peer_state["error"])
         self.assertEqual(backend.capture_modes[-2:], [True, False])
 
+    async def test_left_edge_activation_ignores_stale_pre_lock_motion(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        config = AppConfig(machine_name="host", peers=[peer])
+        backend = TrackingBackend()
+        state = StateStore("host", backend.name)
+        controller = BorderController(config, backend, state)
+        client = FakeRemoteClient(connected=True)
+
+        async def resolve_client(_peer):
+            return client
+
+        controller._resolve_client = resolve_client  # type: ignore[method-assign]
+
+        await controller._maybe_activate(Point(0, 500))
+
+        self.assertIsNotNone(controller.active)
+        self.assertEqual(
+            client.sent,
+            [
+                ("control", {"active": True}),
+                ("input", {"action": "move", "x": 1678, "y": 486}),
+            ],
+        )
+
+        await controller._handle_move(0, 500)
+        self.assertEqual(len(client.sent), 2)
+
+        await controller._handle_move(controller.lock_point.x, controller.lock_point.y)
+        await controller._handle_move(controller.lock_point.x - 5, controller.lock_point.y)
+
+        self.assertEqual(client.sent[-1], ("input", {"action": "move", "x": 1673, "y": 486}))
+
 
 if __name__ == "__main__":
     unittest.main()
