@@ -11,6 +11,15 @@ class FakeKey:
     shift = "SHIFT"
     shift_l = "SHIFT_L"
     shift_r = "SHIFT_R"
+    ctrl = "CTRL"
+    ctrl_l = "CTRL_L"
+    ctrl_r = "CTRL_R"
+    alt = "ALT"
+    alt_l = "ALT_L"
+    alt_r = "ALT_R"
+    cmd = "CMD"
+    cmd_l = "CMD_L"
+    cmd_r = "CMD_R"
 
 
 class FakeKeyboardModule:
@@ -87,6 +96,7 @@ def make_replay_backend() -> tuple[PynputBackend, FakeKeyboardController]:
     backend._keyboard_controller = controller
     backend._replay_shift_keys = set()
     backend._replay_one_shot_chars = set()
+    backend._shift_down = False
     return backend, controller
 
 
@@ -172,6 +182,21 @@ class InputBackendTests(unittest.TestCase):
             controller.events,
             [("press", "SHIFT"), ("press", "A"), ("release", "A"), ("release", "SHIFT")],
         )
+
+    def test_reset_modifiers_releases_option_alt_keys(self) -> None:
+        backend, controller = make_replay_backend()
+        backend._shift_down = True
+        backend._replay_shift_keys.add("shift")
+        backend._replay_one_shot_chars.add("1")
+
+        backend.reset_modifiers()
+
+        self.assertFalse(backend._shift_down)
+        self.assertEqual(backend._replay_shift_keys, set())
+        self.assertEqual(backend._replay_one_shot_chars, set())
+        self.assertIn(("release", "ALT"), controller.events)
+        self.assertIn(("release", "ALT_L"), controller.events)
+        self.assertIn(("release", "ALT_R"), controller.events)
 
     def test_simple_mouse_click_replays_as_native_click(self) -> None:
         backend, controller = make_mouse_backend()

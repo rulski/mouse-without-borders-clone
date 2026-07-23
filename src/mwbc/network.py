@@ -366,6 +366,7 @@ class AgentServer:
             apply_input_event(self.backend, message.payload)
             self.state.increment("events_received")
         elif message.type == "control":
+            self.backend.reset_modifiers()
             self.state.update_incoming(incoming_key, active=message.payload.get("active"))
         elif message.type == "clipboard":
             await self._apply_clipboard_message(message, incoming_key)
@@ -627,6 +628,7 @@ class ClientConnector:
             apply_input_event(self.backend, message.payload)
             self.state.increment("events_received")
         elif message.type == "control":
+            self.backend.reset_modifiers()
             self._host_active = bool(message.payload.get("active"))
             self.state.update(host_active=self._host_active)
         elif message.type == "clipboard":

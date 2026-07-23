@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 from mwbc.config import AppConfig, PeerConfig
-from mwbc.controller import ActiveRemote, BorderController
+from mwbc.controller import REMOTE_MODIFIER_RESET_KEYS, ActiveRemote, BorderController
 from mwbc.geometry import Point
 from mwbc.input_backend import NullBackend
 from mwbc.state import StateStore
@@ -169,13 +169,15 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         await controller._maybe_activate(Point(0, 500))
 
         self.assertIsNotNone(controller.active)
+        self.assertEqual(client.sent[0], ("control", {"active": True}))
         self.assertEqual(
-            client.sent,
+            client.sent[1 : 1 + len(REMOTE_MODIFIER_RESET_KEYS)],
             [
-                ("control", {"active": True}),
-                ("input", {"action": "move", "x": 1678, "y": 486}),
+                ("input", {"action": "key_release", "key": {"kind": "special", "value": key}})
+                for key in REMOTE_MODIFIER_RESET_KEYS
             ],
         )
+        self.assertEqual(client.sent[-1], ("input", {"action": "move", "x": 1678, "y": 486}))
         self.assertEqual(
             backend.actions[-3:],
             [("cursor_visible", False), ("move_to", 1, 500), ("capture", True)],
@@ -183,7 +185,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state.snapshot()["local_cursor_visible"])
 
         await controller._handle_move(0, 500)
-        self.assertEqual(len(client.sent), 2)
+        self.assertEqual(len(client.sent), 2 + len(REMOTE_MODIFIER_RESET_KEYS))
 
         await controller._handle_move(controller.lock_point.x, controller.lock_point.y)
         await controller._handle_move(controller.lock_point.x - 5, controller.lock_point.y)
@@ -207,7 +209,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         controller._ignore_lock_motion_until = 0.0
         await controller._handle_move(0, 500)
 
-        self.assertEqual(len(client.sent), 2)
+        self.assertEqual(len(client.sent), 2 + len(REMOTE_MODIFIER_RESET_KEYS))
         self.assertEqual(controller.active.point, Point(1678, 486))
         self.assertEqual(backend.current_position(), (controller.lock_point.x, controller.lock_point.y))
 

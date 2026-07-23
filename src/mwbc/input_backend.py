@@ -84,6 +84,9 @@ class InputBackend(Protocol):
     def key_release(self, key: dict[str, str]) -> None:
         ...
 
+    def reset_modifiers(self) -> None:
+        ...
+
     def set_cursor_visible(self, visible: bool) -> None:
         ...
 
@@ -128,6 +131,9 @@ class NullBackend:
 
     def key_release(self, key: dict[str, str]) -> None:
         logger.info("null key_release(%s)", key)
+
+    def reset_modifiers(self) -> None:
+        logger.info("null reset_modifiers()")
 
     def set_cursor_visible(self, visible: bool) -> None:
         self._cursor_visible = bool(visible)
@@ -248,6 +254,16 @@ class PynputBackend:
             return
 
         self._keyboard_controller.release(self._key_from_wire(key))
+
+    def reset_modifiers(self) -> None:
+        self._replay_shift_keys.clear()
+        self._replay_one_shot_chars.clear()
+        self._shift_down = False
+        for key in self._modifier_keys_for_reset():
+            try:
+                self._keyboard_controller.release(key)
+            except Exception:
+                logger.debug("failed to release modifier %r", key, exc_info=True)
 
     def set_cursor_visible(self, visible: bool) -> None:
         if visible and self._cursor_hidden:
@@ -385,6 +401,29 @@ class PynputBackend:
         for shift_key in released_shifts:
             self._keyboard_controller.press(shift_key)
 
+    def _modifier_keys_for_reset(self) -> list[Any]:
+        names = [
+            "shift",
+            "shift_l",
+            "shift_r",
+            "ctrl",
+            "ctrl_l",
+            "ctrl_r",
+            "alt",
+            "alt_l",
+            "alt_r",
+            "alt_gr",
+            "cmd",
+            "cmd_l",
+            "cmd_r",
+        ]
+        keys: list[Any] = []
+        for name in names:
+            key = getattr(self._keyboard_module.Key, name, None)
+            if key is not None:
+                keys.append(key)
+        return keys
+
     def _hide_cursor(self) -> None:
         if sys.platform.startswith("win"):
             self._set_windows_cursor_visible(False)
@@ -467,5 +506,7 @@ def apply_input_event(backend: InputBackend, event: dict[str, Any]) -> None:
         backend.key_press(dict(event["key"]))
     elif action == "key_release":
         backend.key_release(dict(event["key"]))
+    elif action == "reset_modifiers":
+        backend.reset_modifiers()
     else:
         raise ValueError(f"unknown input action {action!r}")

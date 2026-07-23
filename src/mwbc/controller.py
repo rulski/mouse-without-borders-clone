@@ -19,6 +19,20 @@ LOCK_MOTION_DROP_SECONDS = 0.2
 MAX_LOCK_DELTA_RATIO = 0.25
 RETURN_CONFIRM_DELAY_SECONDS = 0.03
 LOCK_PARK_RUNWAY_PX = 1
+REMOTE_MODIFIER_RESET_KEYS = (
+    "shift",
+    "shift_l",
+    "shift_r",
+    "ctrl",
+    "ctrl_l",
+    "ctrl_r",
+    "alt",
+    "alt_l",
+    "alt_r",
+    "cmd",
+    "cmd_l",
+    "cmd_r",
+)
 
 
 @dataclass(slots=True)
@@ -284,6 +298,7 @@ class BorderController:
             )
             self.state.update(active_peer=peer.name)
             await client.send("control", {"active": True})
+            await self._send_remote_modifier_reset(client)
             await client.send("input", {"action": "move", "x": remote_point.x, "y": remote_point.y})
             self.state.increment("events_forwarded")
             self._set_local_cursor_visible(False)
@@ -384,6 +399,7 @@ class BorderController:
         self.active = None
         control_error: Exception | None = None
         try:
+            await self._send_remote_modifier_reset(active.client)
             await active.client.send("control", {"active": False})
         except Exception as exc:
             control_error = exc
@@ -417,6 +433,10 @@ class BorderController:
             return
         await self.active.client.send("input", {"action": "click", "button": button, "pressed": pressed})
         self.state.increment("events_forwarded")
+
+    async def _send_remote_modifier_reset(self, client: object) -> None:
+        for key in REMOTE_MODIFIER_RESET_KEYS:
+            await client.send("input", {"action": "key_release", "key": {"kind": "special", "value": key}})
 
     async def _handle_scroll(self, dx: int, dy: int) -> None:
         if self.active is None:
