@@ -18,8 +18,7 @@ HOST_LOCK_HOTKEY = "F12"
 LOCK_MOTION_DROP_SECONDS = 0.2
 MAX_LOCK_DELTA_RATIO = 0.25
 RETURN_CONFIRM_DELAY_SECONDS = 0.03
-LOCK_PARK_MARGIN_RATIO = 0.15
-MIN_LOCK_PARK_MARGIN_PX = 96
+LOCK_PARK_RUNWAY_PX = 24
 
 
 @dataclass(slots=True)
@@ -315,7 +314,7 @@ class BorderController:
         return self._default_lock_point()
 
     def _lock_margin(self, axis_length: int) -> int:
-        return min(max(1, axis_length // 2), max(MIN_LOCK_PARK_MARGIN_PX, round(axis_length * LOCK_PARK_MARGIN_RATIO)))
+        return min(max(1, axis_length // 2), LOCK_PARK_RUNWAY_PX)
 
     def _set_local_cursor_visible(self, visible: bool) -> None:
         try:
