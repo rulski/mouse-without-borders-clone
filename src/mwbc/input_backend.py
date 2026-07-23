@@ -84,6 +84,9 @@ class InputBackend(Protocol):
     def key_release(self, key: dict[str, str]) -> None:
         ...
 
+    def set_cursor_visible(self, visible: bool) -> None:
+        ...
+
     def start_capture(self, callbacks: CaptureCallbacks, *, suppress: bool) -> None:
         ...
 
@@ -97,6 +100,7 @@ class NullBackend:
     def __init__(self, reason: str | None = None) -> None:
         self.reason = reason
         self._position = (960, 540)
+        self._cursor_visible = True
 
     def screen_size(self) -> tuple[int, int]:
         return (1920, 1080)
@@ -125,6 +129,10 @@ class NullBackend:
     def key_release(self, key: dict[str, str]) -> None:
         logger.info("null key_release(%s)", key)
 
+    def set_cursor_visible(self, visible: bool) -> None:
+        self._cursor_visible = bool(visible)
+        logger.info("null set_cursor_visible(%s)", visible)
+
     def start_capture(self, callbacks: CaptureCallbacks, *, suppress: bool) -> None:
         logger.warning("null backend cannot capture native input%s", f": {self.reason}" if self.reason else "")
 
@@ -151,6 +159,7 @@ class PynputBackend:
         self._pending_tap_clicks: dict[str, PendingTapClick] = {}
         self._click_lock = threading.RLock()
         self._coalesce_tap_clicks = sys.platform == "darwin"
+        self._cursor_hidden = False
 
     def screen_size(self) -> tuple[int, int]:
         if sys.platform.startswith("win"):
@@ -239,6 +248,14 @@ class PynputBackend:
             return
 
         self._keyboard_controller.release(self._key_from_wire(key))
+
+    def set_cursor_visible(self, visible: bool) -> None:
+        if visible and self._cursor_hidden:
+            self._show_cursor()
+            self._cursor_hidden = False
+        elif not visible and not self._cursor_hidden:
+            self._hide_cursor()
+            self._cursor_hidden = True
 
     def start_capture(self, callbacks: CaptureCallbacks, *, suppress: bool) -> None:
         self.stop_capture()
@@ -367,6 +384,48 @@ class PynputBackend:
         self._keyboard_controller.release(char)
         for shift_key in released_shifts:
             self._keyboard_controller.press(shift_key)
+
+    def _hide_cursor(self) -> None:
+        if sys.platform.startswith("win"):
+            self._set_windows_cursor_visible(False)
+            return
+        if sys.platform == "darwin":
+            self._set_macos_cursor_visible(False)
+
+    def _show_cursor(self) -> None:
+        if sys.platform.startswith("win"):
+            self._set_windows_cursor_visible(True)
+            return
+        if sys.platform == "darwin":
+            self._set_macos_cursor_visible(True)
+
+    def _set_windows_cursor_visible(self, visible: bool) -> None:
+        try:
+            import ctypes
+
+            show_cursor = ctypes.windll.user32.ShowCursor
+            if visible:
+                for _ in range(32):
+                    if show_cursor(True) >= 0:
+                        break
+            else:
+                for _ in range(32):
+                    if show_cursor(False) < 0:
+                        break
+        except Exception:
+            logger.debug("failed to set Windows cursor visibility", exc_info=True)
+
+    def _set_macos_cursor_visible(self, visible: bool) -> None:
+        try:
+            from Quartz import CGDisplayHideCursor, CGDisplayShowCursor, CGMainDisplayID
+
+            display_id = CGMainDisplayID()
+            if visible:
+                CGDisplayShowCursor(display_id)
+            else:
+                CGDisplayHideCursor(display_id)
+        except Exception:
+            logger.debug("failed to set macOS cursor visibility", exc_info=True)
 
 
 def _is_shift_wire(key: dict[str, str]) -> bool:

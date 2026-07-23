@@ -25,6 +25,10 @@ class TrackingBackend(NullBackend):
         super().move_to(x, y)
         self.actions.append(("move_to", int(x), int(y)))
 
+    def set_cursor_visible(self, visible: bool) -> None:
+        super().set_cursor_visible(visible)
+        self.actions.append(("cursor_visible", bool(visible)))
+
 
 class FakeRemoteClient:
     def __init__(self, *, connected: bool = True) -> None:
@@ -172,6 +176,11 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                 ("input", {"action": "move", "x": 1678, "y": 486}),
             ],
         )
+        self.assertEqual(
+            backend.actions[-3:],
+            [("cursor_visible", False), ("move_to", 960, 540), ("capture", True)],
+        )
+        self.assertFalse(state.snapshot()["local_cursor_visible"])
 
         await controller._handle_move(0, 500)
         self.assertEqual(len(client.sent), 2)
@@ -251,10 +260,11 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         release_capture = backend.actions.index(("capture", False))
         snapshot = state.snapshot()
         self.assertLess(first_return_move, release_capture)
-        self.assertEqual(backend.actions[-1], ("move_to", 2, 500))
+        self.assertEqual(backend.actions[-2:], [("move_to", 2, 500), ("cursor_visible", True)])
         self.assertEqual(snapshot["last_return_peer"], "mac")
         self.assertEqual(snapshot["last_return_x"], 2)
         self.assertEqual(snapshot["last_return_y"], 500)
+        self.assertTrue(snapshot["local_cursor_visible"])
 
     async def test_recovery_uses_latest_remembered_return_point(self) -> None:
         peer = PeerConfig(name="mac", edge="left")

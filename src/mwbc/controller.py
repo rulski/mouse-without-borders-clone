@@ -73,6 +73,7 @@ class BorderController:
         self._active_watch_task = asyncio.create_task(self._active_watch_loop(), name="mwbc-active-watch")
 
     async def stop(self) -> None:
+        self._set_local_cursor_visible(True)
         self.backend.stop_capture()
         for task in (self._event_task, self._reconnect_task, self._active_watch_task):
             if task is not None:
@@ -274,6 +275,7 @@ class BorderController:
             await client.send("control", {"active": True})
             await client.send("input", {"action": "move", "x": remote_point.x, "y": remote_point.y})
             self.state.increment("events_forwarded")
+            self._set_local_cursor_visible(False)
             self._lock_local_pointer()
             if self.config.suppress_local_events_when_remote:
                 self._start_capture(suppress=True)
@@ -283,6 +285,13 @@ class BorderController:
         self.backend.move_to(self.lock_point.x, self.lock_point.y)
         self._ignore_next_lock_motion = True
         self._ignore_lock_motion_until = time.monotonic() + LOCK_MOTION_DROP_SECONDS
+
+    def _set_local_cursor_visible(self, visible: bool) -> None:
+        try:
+            self.backend.set_cursor_visible(visible)
+        except Exception:
+            logger.debug("failed to set local cursor visibility", exc_info=True)
+        self.state.update(local_cursor_visible=visible)
 
     def _is_lock_point(self, point: Point) -> bool:
         return abs(point.x - self.lock_point.x) <= 1 and abs(point.y - self.lock_point.y) <= 1
@@ -314,6 +323,7 @@ class BorderController:
             self._start_capture(suppress=False)
             await asyncio.sleep(RETURN_CONFIRM_DELAY_SECONDS)
             self.backend.move_to(local_point.x, local_point.y)
+        self._set_local_cursor_visible(True)
 
     async def _resolve_client(self, peer: PeerConfig) -> object:
         if self.host_registry is not None:
