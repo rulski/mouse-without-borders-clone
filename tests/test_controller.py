@@ -178,7 +178,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             backend.actions[-3:],
-            [("cursor_visible", False), ("move_to", 960, 540), ("capture", True)],
+            [("cursor_visible", False), ("move_to", 288, 500), ("capture", True)],
         )
         self.assertFalse(state.snapshot()["local_cursor_visible"])
 

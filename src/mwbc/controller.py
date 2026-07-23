@@ -18,6 +18,8 @@ HOST_LOCK_HOTKEY = "F12"
 LOCK_MOTION_DROP_SECONDS = 0.2
 MAX_LOCK_DELTA_RATIO = 0.25
 RETURN_CONFIRM_DELAY_SECONDS = 0.03
+LOCK_PARK_MARGIN_RATIO = 0.15
+MIN_LOCK_PARK_MARGIN_PX = 96
 
 
 @dataclass(slots=True)
@@ -48,7 +50,8 @@ class BorderController:
         }
         self.active: ActiveRemote | None = None
         self.local_size = Size(*backend.screen_size())
-        self.lock_point = Point(max(1, self.local_size.width // 2), max(1, self.local_size.height // 2))
+        self.lock_point = self._default_lock_point()
+        self._last_activation_point: Point | None = None
         self._event_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
         self._active_watch_task: asyncio.Task[None] | None = None
@@ -215,14 +218,21 @@ class BorderController:
             return
 
         if self._ignore_next_lock_motion:
-            if self._is_lock_point(Point(x, y)):
+            current_point = Point(x, y)
+            if self._is_lock_point(current_point):
                 self._ignore_next_lock_motion = False
                 self._ignore_lock_motion_until = 0.0
+                self._last_activation_point = None
                 return
             if time.monotonic() <= self._ignore_lock_motion_until:
                 return
+            if self._is_last_activation_point(current_point):
+                self._lock_local_pointer()
+                self._last_activation_point = None
+                return
             self._ignore_next_lock_motion = False
             self._ignore_lock_motion_until = 0.0
+            self._last_activation_point = None
 
         delta = Point(x - self.lock_point.x, y - self.lock_point.y)
         if delta.x == 0 and delta.y == 0:
@@ -265,6 +275,8 @@ class BorderController:
 
             remote_size = Size(client.remote_screen.width, client.remote_screen.height)
             remote_point = entry_position(peer.edge, point, self.local_size, remote_size)
+            self.lock_point = self._parking_lock_point(peer.edge, point)
+            self._last_activation_point = point
             self.active = ActiveRemote(
                 peer=peer,
                 client=client,
@@ -286,6 +298,25 @@ class BorderController:
         self._ignore_next_lock_motion = True
         self._ignore_lock_motion_until = time.monotonic() + LOCK_MOTION_DROP_SECONDS
 
+    def _default_lock_point(self) -> Point:
+        return Point(max(1, self.local_size.width // 2), max(1, self.local_size.height // 2))
+
+    def _parking_lock_point(self, edge: str, activation_point: Point) -> Point:
+        x_margin = self._lock_margin(self.local_size.width)
+        y_margin = self._lock_margin(self.local_size.height)
+        if edge == "left":
+            return Point(x_margin, clamp(activation_point.y, y_margin, self.local_size.height - y_margin - 1))
+        if edge == "right":
+            return Point(self.local_size.width - x_margin - 1, clamp(activation_point.y, y_margin, self.local_size.height - y_margin - 1))
+        if edge == "top":
+            return Point(clamp(activation_point.x, x_margin, self.local_size.width - x_margin - 1), y_margin)
+        if edge == "bottom":
+            return Point(clamp(activation_point.x, x_margin, self.local_size.width - x_margin - 1), self.local_size.height - y_margin - 1)
+        return self._default_lock_point()
+
+    def _lock_margin(self, axis_length: int) -> int:
+        return min(max(1, axis_length // 2), max(MIN_LOCK_PARK_MARGIN_PX, round(axis_length * LOCK_PARK_MARGIN_RATIO)))
+
     def _set_local_cursor_visible(self, visible: bool) -> None:
         try:
             self.backend.set_cursor_visible(visible)
@@ -300,6 +331,11 @@ class BorderController:
         max_dx = max(80, round(self.local_size.width * MAX_LOCK_DELTA_RATIO))
         max_dy = max(80, round(self.local_size.height * MAX_LOCK_DELTA_RATIO))
         return abs(delta.x) > max_dx or abs(delta.y) > max_dy
+
+    def _is_last_activation_point(self, point: Point) -> bool:
+        if self._last_activation_point is None:
+            return False
+        return abs(point.x - self._last_activation_point.x) <= 1 and abs(point.y - self._last_activation_point.y) <= 1
 
     def _local_return_point(self, active: ActiveRemote) -> Point:
         if active.return_point is not None:
@@ -318,12 +354,14 @@ class BorderController:
         )
 
     async def _restore_local_pointer(self, local_point: Point) -> None:
+        self._last_activation_point = None
         self.backend.move_to(local_point.x, local_point.y)
         if self.config.suppress_local_events_when_remote:
             self._start_capture(suppress=False)
             await asyncio.sleep(RETURN_CONFIRM_DELAY_SECONDS)
             self.backend.move_to(local_point.x, local_point.y)
         self._set_local_cursor_visible(True)
+        self.lock_point = self._default_lock_point()
 
     async def _resolve_client(self, peer: PeerConfig) -> object:
         if self.host_registry is not None:
