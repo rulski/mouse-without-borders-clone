@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -12,6 +13,7 @@ MouseMoveCallback = Callable[[int, int], None]
 MouseClickCallback = Callable[[int, int, str, bool], None]
 MouseScrollCallback = Callable[[int, int, int, int], None]
 KeyCallback = Callable[[dict[str, str]], None]
+DOUBLE_CLICK_WINDOW_SECONDS = 0.45
 
 
 SHIFTED_SYMBOL_TO_BASE = {
@@ -38,6 +40,12 @@ SHIFTED_SYMBOL_TO_BASE = {
     "?": "/",
 }
 BASE_TO_SHIFTED_SYMBOL = {base: shifted for shifted, base in SHIFTED_SYMBOL_TO_BASE.items()}
+
+
+@dataclass(slots=True)
+class PendingTapClick:
+    button: Any
+    timer: threading.Timer
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +148,9 @@ class PynputBackend:
         self._replay_shift_keys: set[str] = set()
         self._replay_one_shot_chars: set[str] = set()
         self._pending_click_presses: dict[str, Any] = {}
+        self._pending_tap_clicks: dict[str, PendingTapClick] = {}
+        self._click_lock = threading.RLock()
+        self._coalesce_tap_clicks = sys.platform == "darwin"
 
     def screen_size(self) -> tuple[int, int]:
         if sys.platform.startswith("win"):
@@ -168,25 +179,35 @@ class PynputBackend:
         return (int(x), int(y))
 
     def move_to(self, x: int, y: int) -> None:
+        self._flush_pending_tap_clicks()
         self._flush_pending_click_presses()
         self._mouse_controller.position = (int(x), int(y))
 
     def move_relative(self, dx: int, dy: int) -> None:
+        self._flush_pending_tap_clicks()
         self._flush_pending_click_presses()
         self._mouse_controller.move(int(dx), int(dy))
 
     def click(self, button: str, pressed: bool) -> None:
         btn = self._button_from_name(button)
+        if not self._coalesce_tap_clicks:
+            if pressed:
+                self._mouse_controller.press(btn)
+            else:
+                self._mouse_controller.release(btn)
+            return
+
         if pressed:
             self._pending_click_presses.setdefault(button, btn)
         else:
             pending = self._pending_click_presses.pop(button, None)
             if pending is not None:
-                self._mouse_controller.click(pending, 1)
+                self._queue_tap_click(button, pending)
             else:
                 self._mouse_controller.release(btn)
 
     def scroll(self, dx: int, dy: int) -> None:
+        self._flush_pending_tap_clicks()
         self._flush_pending_click_presses()
         self._mouse_controller.scroll(int(dx), int(dy))
 
@@ -283,6 +304,38 @@ class PynputBackend:
         self._pending_click_presses.clear()
         for button in pending:
             self._mouse_controller.press(button)
+
+    def _queue_tap_click(self, button_name: str, button: Any) -> None:
+        with self._click_lock:
+            prior = self._pending_tap_clicks.pop(button_name, None)
+            if prior is not None:
+                prior.timer.cancel()
+            else:
+                timer = self._schedule_tap_click_flush(button_name)
+                self._pending_tap_clicks[button_name] = PendingTapClick(button=button, timer=timer)
+                return
+
+        self._mouse_controller.click(button, 2)
+
+    def _schedule_tap_click_flush(self, button_name: str) -> threading.Timer:
+        timer = threading.Timer(DOUBLE_CLICK_WINDOW_SECONDS, self._flush_pending_tap_click, args=(button_name,))
+        timer.daemon = True
+        timer.start()
+        return timer
+
+    def _flush_pending_tap_click(self, button_name: str) -> None:
+        with self._click_lock:
+            pending = self._pending_tap_clicks.pop(button_name, None)
+        if pending is not None:
+            self._mouse_controller.click(pending.button, 1)
+
+    def _flush_pending_tap_clicks(self) -> None:
+        with self._click_lock:
+            pending = list(self._pending_tap_clicks.values())
+            self._pending_tap_clicks.clear()
+        for item in pending:
+            item.timer.cancel()
+            self._mouse_controller.click(item.button, 1)
 
     def _key_to_wire(self, key: Any) -> dict[str, str]:
         char = getattr(key, "char", None)

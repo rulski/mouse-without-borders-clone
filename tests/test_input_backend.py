@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -67,6 +68,18 @@ class FakeMouseController:
         self.events.append(("scroll", (dx, dy)))
 
 
+class FakeTimer:
+    def __init__(self) -> None:
+        self.started = False
+        self.canceled = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def cancel(self) -> None:
+        self.canceled = True
+
+
 def make_replay_backend() -> tuple[PynputBackend, FakeKeyboardController]:
     backend = object.__new__(PynputBackend)
     controller = FakeKeyboardController()
@@ -77,12 +90,24 @@ def make_replay_backend() -> tuple[PynputBackend, FakeKeyboardController]:
     return backend, controller
 
 
-def make_mouse_backend() -> tuple[PynputBackend, FakeMouseController]:
+def make_mouse_backend(*, coalesce: bool = False) -> tuple[PynputBackend, FakeMouseController]:
     backend = object.__new__(PynputBackend)
     controller = FakeMouseController()
     backend._mouse_module = FakeMouseModule
     backend._mouse_controller = controller
     backend._pending_click_presses = {}
+    backend._pending_tap_clicks = {}
+    backend._click_lock = threading.RLock()
+    backend._coalesce_tap_clicks = coalesce
+    backend._fake_timers = []
+
+    def schedule_tap_click_flush(button_name: str) -> FakeTimer:
+        timer = FakeTimer()
+        timer.start()
+        backend._fake_timers.append((button_name, timer))
+        return timer
+
+    backend._schedule_tap_click_flush = schedule_tap_click_flush  # type: ignore[method-assign]
     return backend, controller
 
 
@@ -154,10 +179,55 @@ class InputBackendTests(unittest.TestCase):
         backend.click("left", True)
         backend.click("left", False)
 
-        self.assertEqual(controller.events, [("click", ("LEFT", 1))])
+        self.assertEqual(controller.events, [("press", "LEFT"), ("release", "LEFT")])
 
     def test_mouse_drag_flushes_pending_press_before_move(self) -> None:
         backend, controller = make_mouse_backend()
+
+        backend.click("left", True)
+        backend.move_relative(4, 5)
+        backend.click("left", False)
+
+        self.assertEqual(
+            controller.events,
+            [("press", "LEFT"), ("move_relative", (4, 5)), ("release", "LEFT")],
+        )
+
+    def test_coalesced_single_click_waits_until_flush(self) -> None:
+        backend, controller = make_mouse_backend(coalesce=True)
+
+        backend.click("left", True)
+        backend.click("left", False)
+
+        self.assertEqual(controller.events, [])
+        self.assertEqual(len(backend._pending_tap_clicks), 1)
+        backend._flush_pending_tap_clicks()
+        self.assertEqual(controller.events, [("click", ("LEFT", 1))])
+        self.assertTrue(backend._fake_timers[0][1].canceled)
+
+    def test_coalesced_double_click_replays_as_native_double_click(self) -> None:
+        backend, controller = make_mouse_backend(coalesce=True)
+
+        backend.click("left", True)
+        backend.click("left", False)
+        backend.click("left", True)
+        backend.click("left", False)
+
+        self.assertEqual(controller.events, [("click", ("LEFT", 2))])
+        self.assertEqual(backend._pending_tap_clicks, {})
+        self.assertTrue(backend._fake_timers[0][1].canceled)
+
+    def test_coalesced_click_flushes_before_move(self) -> None:
+        backend, controller = make_mouse_backend(coalesce=True)
+
+        backend.click("left", True)
+        backend.click("left", False)
+        backend.move_relative(4, 5)
+
+        self.assertEqual(controller.events, [("click", ("LEFT", 1)), ("move_relative", (4, 5))])
+
+    def test_coalesced_drag_flushes_pending_press_before_move(self) -> None:
+        backend, controller = make_mouse_backend(coalesce=True)
 
         backend.click("left", True)
         backend.move_relative(4, 5)
