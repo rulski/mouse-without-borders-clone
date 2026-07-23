@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 HOST_LOCK_HOTKEY = "F12"
 LOCK_MOTION_DROP_SECONDS = 0.2
 MAX_LOCK_DELTA_RATIO = 0.25
+RETURN_CONFIRM_DELAY_SECONDS = 0.03
 
 
 @dataclass(slots=True)
@@ -173,13 +174,24 @@ class BorderController:
         if mark_disconnected:
             self.state.update_peer(active.peer.name, connected=False, error=reason)
             self.state.set_error(f"{active.peer.name}: {reason}")
-        if self.config.suppress_local_events_when_remote:
-            self._start_capture(suppress=False)
         local_point = self._local_return_point(active)
-        self.backend.move_to(local_point.x, local_point.y)
+        await self._restore_local_pointer(local_point)
         self._ignore_next_lock_motion = False
         self._ignore_lock_motion_until = 0.0
-        logger.info("returned control to local host after remote failure: %s", reason)
+        self.state.update(
+            last_return_peer=active.peer.name,
+            last_return_x=local_point.x,
+            last_return_y=local_point.y,
+            last_return_reason=reason,
+            last_return_at=time.time(),
+        )
+        logger.info(
+            "returned control from %s to local point (%s, %s): %s",
+            active.peer.name,
+            local_point.x,
+            local_point.y,
+            reason,
+        )
 
     async def _handle_host_lock_hotkey(self, key: dict[str, str], *, pressed: bool) -> bool:
         if not _is_host_lock_hotkey(key):
@@ -296,6 +308,13 @@ class BorderController:
             Size(active.client.remote_screen.width, active.client.remote_screen.height),
         )
 
+    async def _restore_local_pointer(self, local_point: Point) -> None:
+        self.backend.move_to(local_point.x, local_point.y)
+        if self.config.suppress_local_events_when_remote:
+            self._start_capture(suppress=False)
+            await asyncio.sleep(RETURN_CONFIRM_DELAY_SECONDS)
+            self.backend.move_to(local_point.x, local_point.y)
+
     async def _resolve_client(self, peer: PeerConfig) -> object:
         if self.host_registry is not None:
             hosted_client = await self.host_registry.get(peer.name)
@@ -321,12 +340,27 @@ class BorderController:
             await active.client.send("control", {"active": False})
         except Exception as exc:
             control_error = exc
-        if self.config.suppress_local_events_when_remote:
-            self._start_capture(suppress=False)
-        self.backend.move_to(local_point.x, local_point.y)
+        await self._restore_local_pointer(local_point)
         self._ignore_next_lock_motion = False
         self._ignore_lock_motion_until = 0.0
-        self.state.update(active_peer=None)
+        self.state.update(
+            active_peer=None,
+            last_return_peer=active.peer.name,
+            last_return_x=local_point.x,
+            last_return_y=local_point.y,
+            last_remote_x=remote_point.x,
+            last_remote_y=remote_point.y,
+            last_return_reason="remote edge exit",
+            last_return_at=time.time(),
+        )
+        logger.info(
+            "returned control from %s remote point (%s, %s) to local point (%s, %s)",
+            active.peer.name,
+            remote_point.x,
+            remote_point.y,
+            local_point.x,
+            local_point.y,
+        )
         if control_error is not None:
             self.state.update_peer(active.peer.name, connected=False, error=str(control_error))
             self.state.set_error(f"{active.peer.name}: {control_error}")

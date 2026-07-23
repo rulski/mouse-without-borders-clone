@@ -15,9 +15,15 @@ class TrackingBackend(NullBackend):
     def __init__(self) -> None:
         super().__init__()
         self.capture_modes: list[bool] = []
+        self.actions: list[tuple] = []
 
     def start_capture(self, callbacks, *, suppress: bool) -> None:
         self.capture_modes.append(suppress)
+        self.actions.append(("capture", suppress))
+
+    def move_to(self, x: int, y: int) -> None:
+        super().move_to(x, y)
+        self.actions.append(("move_to", int(x), int(y)))
 
 
 class FakeRemoteClient:
@@ -228,6 +234,27 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.current_position(), (2, 500))
         self.assertEqual(backend.capture_modes[-2:], [True, False])
         self.assertIn("fake client disconnected", snapshot["last_error"])
+
+    async def test_deactivate_restores_edge_before_releasing_capture(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        config = AppConfig(machine_name="host", peers=[peer])
+        backend = TrackingBackend()
+        state = StateStore("host", backend.name)
+        controller = BorderController(config, backend, state)
+        controller.active = ActiveRemote(peer=peer, client=FakeRemoteClient(), point=Point(1678, 486))
+        state.update(active_peer="mac")
+        controller._start_capture(suppress=True)
+
+        await controller._deactivate(Point(1679, 486))
+
+        first_return_move = backend.actions.index(("move_to", 2, 500))
+        release_capture = backend.actions.index(("capture", False))
+        snapshot = state.snapshot()
+        self.assertLess(first_return_move, release_capture)
+        self.assertEqual(backend.actions[-1], ("move_to", 2, 500))
+        self.assertEqual(snapshot["last_return_peer"], "mac")
+        self.assertEqual(snapshot["last_return_x"], 2)
+        self.assertEqual(snapshot["last_return_y"], 500)
 
     async def test_recovery_uses_latest_remembered_return_point(self) -> None:
         peer = PeerConfig(name="mac", edge="left")
