@@ -43,6 +43,7 @@ class CliLayoutTests(unittest.TestCase):
                                 "edge": "top",
                                 "keep_awake": True,
                                 "keep_awake_interval_seconds": 30,
+                                "scroll_multiplier": 3.0,
                             }
                         ]
                     }
@@ -51,11 +52,13 @@ class CliLayoutTests(unittest.TestCase):
                 self.assertEqual(result["peers"][0]["edge"], "top")
                 self.assertTrue(result["peers"][0]["keep_awake"])
                 self.assertEqual(result["peers"][0]["keep_awake_interval_seconds"], 30)
+                self.assertEqual(result["peers"][0]["scroll_multiplier"], 3.0)
 
                 saved = load_config(config_path)
                 self.assertEqual(saved.peers[0].edge, "top")
                 self.assertTrue(saved.peers[0].keep_awake)
                 self.assertEqual(saved.peers[0].keep_awake_interval_seconds, 30)
+                self.assertEqual(saved.peers[0].scroll_multiplier, 3.0)
             finally:
                 loop.close()
 

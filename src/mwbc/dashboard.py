@@ -1000,7 +1000,8 @@ def render_layout_editor(layout: dict) -> str:
           edge: validEdges.includes(peer.edge) ? peer.edge : "right",
           connected: Boolean(peer.connected),
           keep_awake: Boolean(peer.keep_awake),
-          keep_awake_interval_seconds: normalizeInterval(peer.keep_awake_interval_seconds)
+          keep_awake_interval_seconds: normalizeInterval(peer.keep_awake_interval_seconds),
+          scroll_multiplier: normalizeScrollMultiplier(peer.scroll_multiplier)
         }))
         .filter((peer) => peer.name);
     }
@@ -1009,6 +1010,12 @@ def render_layout_editor(layout: dict) -> str:
       const interval = Number(value);
       if (!Number.isFinite(interval)) return 45;
       return Math.min(3600, Math.max(5, Math.round(interval)));
+    }
+
+    function normalizeScrollMultiplier(value) {
+      const multiplier = Number(value);
+      if (!Number.isFinite(multiplier)) return 1;
+      return Math.min(8, Math.max(1, Math.round(multiplier * 10) / 10));
     }
 
     function setStatus(value) {
@@ -1073,7 +1080,20 @@ def render_layout_editor(layout: dict) -> str:
       }));
       intervalLabel.append(document.createTextNode("Every"), interval, document.createTextNode("sec"));
 
-      controls.append(keepAwakeLabel, intervalLabel);
+      const scrollLabel = document.createElement("label");
+      scrollLabel.className = "feature-row";
+      const scrollSpeed = document.createElement("input");
+      scrollSpeed.type = "number";
+      scrollSpeed.min = "1";
+      scrollSpeed.max = "8";
+      scrollSpeed.step = "0.5";
+      scrollSpeed.value = String(peer.scroll_multiplier);
+      scrollSpeed.addEventListener("change", () => updateFeature(peer.name, {
+        scroll_multiplier: normalizeScrollMultiplier(scrollSpeed.value)
+      }));
+      scrollLabel.append(document.createTextNode("Scroll"), scrollSpeed, document.createTextNode("x"));
+
+      controls.append(keepAwakeLabel, intervalLabel, scrollLabel);
 
       card.append(text, select, controls);
       card.addEventListener("dragstart", (event) => {
@@ -1114,6 +1134,7 @@ def render_layout_editor(layout: dict) -> str:
       if (!peer) return;
       Object.assign(peer, updates);
       peer.keep_awake_interval_seconds = normalizeInterval(peer.keep_awake_interval_seconds);
+      peer.scroll_multiplier = normalizeScrollMultiplier(peer.scroll_multiplier);
       render();
       saveLayout();
     }
@@ -1136,7 +1157,8 @@ def render_layout_editor(layout: dict) -> str:
               name: peer.name,
               edge: peer.edge,
               keep_awake: peer.keep_awake,
-              keep_awake_interval_seconds: peer.keep_awake_interval_seconds
+              keep_awake_interval_seconds: peer.keep_awake_interval_seconds,
+              scroll_multiplier: peer.scroll_multiplier
             }))
           })
         });

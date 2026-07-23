@@ -10,7 +10,18 @@ from typing import Any
 DEFAULT_CONFIG_PATH = Path.home() / ".mwbc" / "config.json"
 DEFAULT_PORT = 45445
 DEFAULT_DASHBOARD_PORT = 45446
+DEFAULT_SCROLL_MULTIPLIER = 1.0
+MIN_SCROLL_MULTIPLIER = 1.0
+MAX_SCROLL_MULTIPLIER = 8.0
 VALID_EDGES = {"left", "right", "top", "bottom"}
+
+
+def normalize_scroll_multiplier(value: Any) -> float:
+    try:
+        multiplier = float(value)
+    except (TypeError, ValueError):
+        multiplier = DEFAULT_SCROLL_MULTIPLIER
+    return min(MAX_SCROLL_MULTIPLIER, max(MIN_SCROLL_MULTIPLIER, multiplier))
 
 
 @dataclass(slots=True)
@@ -21,6 +32,7 @@ class PeerConfig:
     port: int = DEFAULT_PORT
     keep_awake: bool = False
     keep_awake_interval_seconds: float = 45.0
+    scroll_multiplier: float = DEFAULT_SCROLL_MULTIPLIER
     shared_secret: str | None = None
 
     @classmethod
@@ -41,6 +53,7 @@ class PeerConfig:
             port=int(data.get("port", DEFAULT_PORT)),
             keep_awake=bool(data.get("keep_awake", False)),
             keep_awake_interval_seconds=float(data.get("keep_awake_interval_seconds", 45.0)),
+            scroll_multiplier=normalize_scroll_multiplier(data.get("scroll_multiplier", DEFAULT_SCROLL_MULTIPLIER)),
             shared_secret=data.get("shared_secret") or None,
         )
 

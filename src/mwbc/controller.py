@@ -421,7 +421,15 @@ class BorderController:
     async def _handle_scroll(self, dx: int, dy: int) -> None:
         if self.active is None:
             return
-        await self.active.client.send("input", {"action": "scroll", "dx": dx, "dy": dy})
+        multiplier = self.active.peer.scroll_multiplier
+        await self.active.client.send(
+            "input",
+            {
+                "action": "scroll",
+                "dx": _scale_scroll_axis(dx, multiplier),
+                "dy": _scale_scroll_axis(dy, multiplier),
+            },
+        )
         self.state.increment("events_forwarded")
 
     async def _send_key(self, action: str, key: dict[str, str]) -> None:
@@ -433,3 +441,10 @@ class BorderController:
 
 def _is_host_lock_hotkey(key: dict[str, str]) -> bool:
     return key.get("kind") == "special" and str(key.get("value", "")).lower() == "f12"
+
+
+def _scale_scroll_axis(value: int, multiplier: float) -> int:
+    if value == 0:
+        return 0
+    sign = -1 if value < 0 else 1
+    return sign * max(1, round(abs(value) * multiplier))

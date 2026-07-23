@@ -266,6 +266,19 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["last_return_y"], 500)
         self.assertTrue(snapshot["local_cursor_visible"])
 
+    async def test_scroll_uses_peer_multiplier(self) -> None:
+        peer = PeerConfig(name="mac", edge="left", scroll_multiplier=3.0)
+        config = AppConfig(machine_name="host", peers=[peer])
+        backend = TrackingBackend()
+        state = StateStore("host", backend.name)
+        controller = BorderController(config, backend, state)
+        client = FakeRemoteClient()
+        controller.active = ActiveRemote(peer=peer, client=client, point=Point(100, 100))
+
+        await controller._handle_scroll(0, -1)
+
+        self.assertEqual(client.sent[-1], ("input", {"action": "scroll", "dx": 0, "dy": -3}))
+
     async def test_recovery_uses_latest_remembered_return_point(self) -> None:
         peer = PeerConfig(name="mac", edge="left")
         config = AppConfig(machine_name="host", peers=[peer])

@@ -22,6 +22,7 @@ from .config import (
     ensure_config,
     generate_secret,
     load_config,
+    normalize_scroll_multiplier,
     save_config,
 )
 from .clipboard import create_clipboard
@@ -236,6 +237,8 @@ def _build_layout_update_handler(
                 "keep_awake": bool(item.get("keep_awake", False)),
                 "keep_awake_interval_seconds": interval,
             }
+            if "scroll_multiplier" in item:
+                updates_by_name[name]["scroll_multiplier"] = normalize_scroll_multiplier(item.get("scroll_multiplier"))
 
         with layout_lock:
             known = {peer.name: peer for peer in config.peers}
@@ -248,6 +251,8 @@ def _build_layout_update_handler(
                 peer.edge = updates["edge"]
                 peer.keep_awake = updates["keep_awake"]
                 peer.keep_awake_interval_seconds = updates["keep_awake_interval_seconds"]
+                if "scroll_multiplier" in updates:
+                    peer.scroll_multiplier = updates["scroll_multiplier"]
             save_config(config, config_path)
             for peer in config.peers:
                 state.register_peer(peer.name, peer.host, peer.port, peer.edge)
@@ -287,6 +292,7 @@ def _layout_snapshot(config: AppConfig, state: StateStore) -> dict[str, Any]:
                 "error": status.get("error"),
                 "keep_awake": peer.keep_awake,
                 "keep_awake_interval_seconds": peer.keep_awake_interval_seconds,
+                "scroll_multiplier": peer.scroll_multiplier,
             }
         )
     return {"machine_name": config.machine_name, "peers": peers}
