@@ -76,7 +76,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         snapshot = state.snapshot()
         self.assertIsNone(controller.active)
         self.assertIsNone(snapshot["active_peer"])
-        self.assertEqual(backend.current_position(), (960, 540))
+        self.assertEqual(backend.current_position(), (2, 5))
         self.assertEqual(backend.capture_modes[-2:], [True, False])
         self.assertEqual(snapshot["peers"][0]["error"], "mac disconnected")
 
@@ -174,6 +174,41 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         await controller._handle_move(controller.lock_point.x - 5, controller.lock_point.y)
 
         self.assertEqual(client.sent[-1], ("input", {"action": "move", "x": 1673, "y": 486}))
+
+    async def test_left_edge_activation_drops_stale_motion_after_grace_window(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        config = AppConfig(machine_name="host", peers=[peer])
+        backend = TrackingBackend()
+        state = StateStore("host", backend.name)
+        controller = BorderController(config, backend, state)
+        client = FakeRemoteClient(connected=True)
+
+        async def resolve_client(_peer):
+            return client
+
+        controller._resolve_client = resolve_client  # type: ignore[method-assign]
+
+        await controller._maybe_activate(Point(0, 500))
+        controller._ignore_lock_motion_until = 0.0
+        await controller._handle_move(0, 500)
+
+        self.assertEqual(len(client.sent), 2)
+        self.assertEqual(controller.active.point, Point(1678, 486))
+        self.assertEqual(backend.current_position(), (controller.lock_point.x, controller.lock_point.y))
+
+    async def test_remote_failure_returns_to_local_edge_when_possible(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        config = AppConfig(machine_name="host", peers=[peer])
+        backend = TrackingBackend()
+        state = StateStore("host", backend.name)
+        controller = BorderController(config, backend, state)
+        controller.active = ActiveRemote(peer=peer, client=FakeRemoteClient(), point=Point(1678, 486))
+        state.update(active_peer="mac")
+        controller._start_capture(suppress=True)
+
+        await controller._recover_local("mac disconnected")
+
+        self.assertEqual(backend.current_position(), (2, 500))
 
 
 if __name__ == "__main__":

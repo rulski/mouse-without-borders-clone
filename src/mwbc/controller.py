@@ -16,6 +16,7 @@ from .state import StateStore
 logger = logging.getLogger(__name__)
 HOST_LOCK_HOTKEY = "F12"
 LOCK_MOTION_DROP_SECONDS = 0.2
+MAX_LOCK_DELTA_RATIO = 0.25
 
 
 @dataclass(slots=True)
@@ -173,7 +174,10 @@ class BorderController:
             self.state.set_error(f"{active.peer.name}: {reason}")
         if self.config.suppress_local_events_when_remote:
             self._start_capture(suppress=False)
-        self._lock_local_pointer()
+        local_point = self._local_return_point(active)
+        self.backend.move_to(local_point.x, local_point.y)
+        self._ignore_next_lock_motion = False
+        self._ignore_lock_motion_until = 0.0
         logger.info("returned control to local host after remote failure: %s", reason)
 
     async def _handle_host_lock_hotkey(self, key: dict[str, str], *, pressed: bool) -> bool:
@@ -208,6 +212,9 @@ class BorderController:
 
         delta = Point(x - self.lock_point.x, y - self.lock_point.y)
         if delta.x == 0 and delta.y == 0:
+            return
+        if self._is_oversized_lock_delta(delta):
+            self._lock_local_pointer()
             return
 
         active = self.active
@@ -260,6 +267,22 @@ class BorderController:
 
     def _is_lock_point(self, point: Point) -> bool:
         return abs(point.x - self.lock_point.x) <= 1 and abs(point.y - self.lock_point.y) <= 1
+
+    def _is_oversized_lock_delta(self, delta: Point) -> bool:
+        max_dx = max(80, round(self.local_size.width * MAX_LOCK_DELTA_RATIO))
+        max_dy = max(80, round(self.local_size.height * MAX_LOCK_DELTA_RATIO))
+        return abs(delta.x) > max_dx or abs(delta.y) > max_dy
+
+    def _local_return_point(self, active: ActiveRemote) -> Point:
+        try:
+            return local_exit_position(
+                active.peer.edge,
+                active.point,
+                self.local_size,
+                Size(active.client.remote_screen.width, active.client.remote_screen.height),
+            )
+        except Exception:
+            return self.lock_point
 
     async def _resolve_client(self, peer: PeerConfig) -> object:
         if self.host_registry is not None:
