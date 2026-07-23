@@ -27,6 +27,46 @@ class FakeKeyboardController:
         self.events.append(("release", key))
 
 
+class FakeButton:
+    left = "LEFT"
+    right = "RIGHT"
+    middle = "MIDDLE"
+
+
+class FakeMouseModule:
+    Button = FakeButton
+
+
+class FakeMouseController:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, object]] = []
+        self._position = (0, 0)
+
+    @property
+    def position(self) -> tuple[int, int]:
+        return self._position
+
+    @position.setter
+    def position(self, value: tuple[int, int]) -> None:
+        self._position = value
+        self.events.append(("move_to", value))
+
+    def move(self, dx: int, dy: int) -> None:
+        self.events.append(("move_relative", (dx, dy)))
+
+    def click(self, button: str, count: int) -> None:
+        self.events.append(("click", (button, count)))
+
+    def press(self, button: str) -> None:
+        self.events.append(("press", button))
+
+    def release(self, button: str) -> None:
+        self.events.append(("release", button))
+
+    def scroll(self, dx: int, dy: int) -> None:
+        self.events.append(("scroll", (dx, dy)))
+
+
 def make_replay_backend() -> tuple[PynputBackend, FakeKeyboardController]:
     backend = object.__new__(PynputBackend)
     controller = FakeKeyboardController()
@@ -34,6 +74,15 @@ def make_replay_backend() -> tuple[PynputBackend, FakeKeyboardController]:
     backend._keyboard_controller = controller
     backend._replay_shift_keys = set()
     backend._replay_one_shot_chars = set()
+    return backend, controller
+
+
+def make_mouse_backend() -> tuple[PynputBackend, FakeMouseController]:
+    backend = object.__new__(PynputBackend)
+    controller = FakeMouseController()
+    backend._mouse_module = FakeMouseModule
+    backend._mouse_controller = controller
+    backend._pending_click_presses = {}
     return backend, controller
 
 
@@ -97,6 +146,26 @@ class InputBackendTests(unittest.TestCase):
         self.assertEqual(
             controller.events,
             [("press", "SHIFT"), ("press", "A"), ("release", "A"), ("release", "SHIFT")],
+        )
+
+    def test_simple_mouse_click_replays_as_native_click(self) -> None:
+        backend, controller = make_mouse_backend()
+
+        backend.click("left", True)
+        backend.click("left", False)
+
+        self.assertEqual(controller.events, [("click", ("LEFT", 1))])
+
+    def test_mouse_drag_flushes_pending_press_before_move(self) -> None:
+        backend, controller = make_mouse_backend()
+
+        backend.click("left", True)
+        backend.move_relative(4, 5)
+        backend.click("left", False)
+
+        self.assertEqual(
+            controller.events,
+            [("press", "LEFT"), ("move_relative", (4, 5)), ("release", "LEFT")],
         )
 
 

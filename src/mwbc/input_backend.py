@@ -139,6 +139,7 @@ class PynputBackend:
         self._shift_down = False
         self._replay_shift_keys: set[str] = set()
         self._replay_one_shot_chars: set[str] = set()
+        self._pending_click_presses: dict[str, Any] = {}
 
     def screen_size(self) -> tuple[int, int]:
         if sys.platform.startswith("win"):
@@ -167,19 +168,26 @@ class PynputBackend:
         return (int(x), int(y))
 
     def move_to(self, x: int, y: int) -> None:
+        self._flush_pending_click_presses()
         self._mouse_controller.position = (int(x), int(y))
 
     def move_relative(self, dx: int, dy: int) -> None:
+        self._flush_pending_click_presses()
         self._mouse_controller.move(int(dx), int(dy))
 
     def click(self, button: str, pressed: bool) -> None:
         btn = self._button_from_name(button)
         if pressed:
-            self._mouse_controller.press(btn)
+            self._pending_click_presses.setdefault(button, btn)
         else:
-            self._mouse_controller.release(btn)
+            pending = self._pending_click_presses.pop(button, None)
+            if pending is not None:
+                self._mouse_controller.click(pending, 1)
+            else:
+                self._mouse_controller.release(btn)
 
     def scroll(self, dx: int, dy: int) -> None:
+        self._flush_pending_click_presses()
         self._mouse_controller.scroll(int(dx), int(dy))
 
     def key_press(self, key: dict[str, str]) -> None:
@@ -267,6 +275,14 @@ class PynputBackend:
 
     def _button_from_name(self, name: str) -> Any:
         return getattr(self._mouse_module.Button, name, self._mouse_module.Button.left)
+
+    def _flush_pending_click_presses(self) -> None:
+        if not self._pending_click_presses:
+            return
+        pending = list(self._pending_click_presses.values())
+        self._pending_click_presses.clear()
+        for button in pending:
+            self._mouse_controller.press(button)
 
     def _key_to_wire(self, key: Any) -> dict[str, str]:
         char = getattr(key, "char", None)
