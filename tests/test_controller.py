@@ -210,6 +210,48 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(backend.current_position(), (2, 500))
 
+    async def test_deactivate_returns_to_local_edge_when_control_send_fails(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        config = AppConfig(machine_name="host", peers=[peer])
+        backend = TrackingBackend()
+        state = StateStore("host", backend.name)
+        controller = BorderController(config, backend, state)
+        controller.active = ActiveRemote(peer=peer, client=FakeRemoteClient(connected=False), point=Point(1678, 486))
+        state.update(active_peer="mac")
+        controller._start_capture(suppress=True)
+
+        await controller._deactivate(Point(1679, 486))
+
+        snapshot = state.snapshot()
+        self.assertIsNone(controller.active)
+        self.assertIsNone(snapshot["active_peer"])
+        self.assertEqual(backend.current_position(), (2, 500))
+        self.assertEqual(backend.capture_modes[-2:], [True, False])
+        self.assertIn("fake client disconnected", snapshot["last_error"])
+
+    async def test_recovery_uses_latest_remembered_return_point(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        config = AppConfig(machine_name="host", peers=[peer])
+        backend = TrackingBackend()
+        state = StateStore("host", backend.name)
+        controller = BorderController(config, backend, state)
+        client = FakeRemoteClient(connected=True)
+
+        async def resolve_client(_peer):
+            return client
+
+        controller._resolve_client = resolve_client  # type: ignore[method-assign]
+
+        await controller._maybe_activate(Point(0, 500))
+        await controller._handle_move(controller.lock_point.x, controller.lock_point.y)
+        await controller._handle_move(controller.lock_point.x, controller.lock_point.y + 100)
+        client._connected = False
+
+        await controller._recover_local("mac disconnected")
+
+        self.assertEqual(backend.current_position()[0], 2)
+        self.assertAlmostEqual(backend.current_position()[1], 600, delta=5)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,7 @@ class ActiveRemote:
     peer: PeerConfig
     client: object
     point: Point
+    return_point: Point | None = None
 
 
 class BorderController:
@@ -229,6 +230,7 @@ class BorderController:
             return
 
         active.point = next_point
+        active.return_point = self._calculate_local_return_point(active, next_point)
         await active.client.send("input", {"action": "move", "x": next_point.x, "y": next_point.y})
         self.state.increment("events_forwarded")
         self._lock_local_pointer()
@@ -250,7 +252,12 @@ class BorderController:
 
             remote_size = Size(client.remote_screen.width, client.remote_screen.height)
             remote_point = entry_position(peer.edge, point, self.local_size, remote_size)
-            self.active = ActiveRemote(peer=peer, client=client, point=remote_point)
+            self.active = ActiveRemote(
+                peer=peer,
+                client=client,
+                point=remote_point,
+                return_point=local_exit_position(peer.edge, remote_point, self.local_size, remote_size),
+            )
             self.state.update(active_peer=peer.name)
             await client.send("control", {"active": True})
             await client.send("input", {"action": "move", "x": remote_point.x, "y": remote_point.y})
@@ -274,15 +281,20 @@ class BorderController:
         return abs(delta.x) > max_dx or abs(delta.y) > max_dy
 
     def _local_return_point(self, active: ActiveRemote) -> Point:
+        if active.return_point is not None:
+            return active.return_point
         try:
-            return local_exit_position(
-                active.peer.edge,
-                active.point,
-                self.local_size,
-                Size(active.client.remote_screen.width, active.client.remote_screen.height),
-            )
+            return self._calculate_local_return_point(active, active.point)
         except Exception:
             return self.lock_point
+
+    def _calculate_local_return_point(self, active: ActiveRemote, remote_point: Point) -> Point:
+        return local_exit_position(
+            active.peer.edge,
+            remote_point,
+            self.local_size,
+            Size(active.client.remote_screen.width, active.client.remote_screen.height),
+        )
 
     async def _resolve_client(self, peer: PeerConfig) -> object:
         if self.host_registry is not None:
@@ -301,18 +313,23 @@ class BorderController:
         active = self.active
         if active is None:
             return
+        local_point = self._calculate_local_return_point(active, remote_point)
+        active.return_point = local_point
         self.active = None
-        await active.client.send("control", {"active": False})
-        local_point = local_exit_position(
-            active.peer.edge,
-            remote_point,
-            self.local_size,
-            Size(active.client.remote_screen.width, active.client.remote_screen.height),
-        )
+        control_error: Exception | None = None
+        try:
+            await active.client.send("control", {"active": False})
+        except Exception as exc:
+            control_error = exc
         if self.config.suppress_local_events_when_remote:
             self._start_capture(suppress=False)
         self.backend.move_to(local_point.x, local_point.y)
+        self._ignore_next_lock_motion = False
+        self._ignore_lock_motion_until = 0.0
         self.state.update(active_peer=None)
+        if control_error is not None:
+            self.state.update_peer(active.peer.name, connected=False, error=str(control_error))
+            self.state.set_error(f"{active.peer.name}: {control_error}")
 
     async def _handle_click(self, _x: int, _y: int, button: str, pressed: bool) -> None:
         if self.active is None:
