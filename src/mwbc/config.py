@@ -11,6 +11,7 @@ DEFAULT_CONFIG_PATH = Path.home() / ".mwbc" / "config.json"
 DEFAULT_PORT = 45445
 DEFAULT_DASHBOARD_PORT = 45446
 DEFAULT_SCROLL_MULTIPLIER = 1.0
+DEFAULT_CLIPBOARD_MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MIN_SCROLL_MULTIPLIER = 1.0
 MAX_SCROLL_MULTIPLIER = 8.0
 VALID_EDGES = {"left", "right", "top", "bottom"}
@@ -84,6 +85,7 @@ class AppConfig:
     clipboard_enabled: bool = True
     clipboard_poll_seconds: float = 0.5
     clipboard_max_text_bytes: int = 262_144
+    clipboard_max_image_bytes: int = DEFAULT_CLIPBOARD_MAX_IMAGE_BYTES
     suppress_local_events_when_remote: bool = True
     edge_threshold_px: int = 2
     peers: list[PeerConfig] = field(default_factory=list)
@@ -103,6 +105,9 @@ class AppConfig:
             clipboard_enabled=bool(data.get("clipboard_enabled", True)),
             clipboard_poll_seconds=float(data.get("clipboard_poll_seconds", 0.5)),
             clipboard_max_text_bytes=int(data.get("clipboard_max_text_bytes", 262_144)),
+            clipboard_max_image_bytes=int(
+                data.get("clipboard_max_image_bytes", DEFAULT_CLIPBOARD_MAX_IMAGE_BYTES)
+            ),
             suppress_local_events_when_remote=bool(data.get("suppress_local_events_when_remote", True)),
             edge_threshold_px=int(data.get("edge_threshold_px", 2)),
             peers=peers,
@@ -120,6 +125,7 @@ class AppConfig:
             "clipboard_enabled": self.clipboard_enabled,
             "clipboard_poll_seconds": self.clipboard_poll_seconds,
             "clipboard_max_text_bytes": self.clipboard_max_text_bytes,
+            "clipboard_max_image_bytes": self.clipboard_max_image_bytes,
             "suppress_local_events_when_remote": self.suppress_local_events_when_remote,
             "edge_threshold_px": self.edge_threshold_px,
             "peers": [peer.to_dict() for peer in self.peers],

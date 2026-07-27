@@ -157,6 +157,112 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             await connector.stop()
             await server.stop()
 
+    async def test_always_looking_client_sends_clipboard_image_to_host(self) -> None:
+        host_config = AppConfig(
+            machine_name="host",
+            pairing_secret="secret",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            clipboard_poll_seconds=0.05,
+            peers=[PeerConfig(name="client", edge="right")],
+        )
+        host_backend = NullBackend()
+        host_clipboard = NullClipboard()
+        host_state = StateStore("host", host_backend.name)
+        host_state.register_peer("client", "", 45445, "right")
+        registry = HostClientRegistry(host_state)
+        server = AgentServer(
+            host_config,
+            host_backend,
+            host_state,
+            host_registry=registry,
+            clipboard=host_clipboard,
+        )
+        await server.start()
+        assert server._server is not None
+        port = server._server.sockets[0].getsockname()[1]
+
+        client_config = AppConfig(
+            machine_name="client",
+            pairing_secret="secret",
+            clipboard_poll_seconds=0.05,
+        )
+        client_backend = NullBackend()
+        client_clipboard = NullClipboard("initial")
+        client_state = StateStore("client", client_backend.name)
+        connector = ClientConnector(
+            config=client_config,
+            backend=client_backend,
+            state=client_state,
+            host="127.0.0.1",
+            port=port,
+            retry_seconds=0.05,
+            clipboard=client_clipboard,
+        )
+
+        try:
+            await connector.start()
+            await self._wait_for_hosted_client(registry, "client")
+            image = b"\x89PNG\r\n\x1a\nclient-image"
+            client_clipboard.set_image_png(image)
+            await self._wait_for_clipboard_image(host_clipboard, image)
+        finally:
+            await connector.stop()
+            await server.stop()
+
+    async def test_host_sends_clipboard_image_to_always_looking_client(self) -> None:
+        host_config = AppConfig(
+            machine_name="host",
+            pairing_secret="secret",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            clipboard_poll_seconds=0.05,
+            peers=[PeerConfig(name="client", edge="right")],
+        )
+        host_backend = NullBackend()
+        host_clipboard = NullClipboard("initial host")
+        host_state = StateStore("host", host_backend.name)
+        host_state.register_peer("client", "", 45445, "right")
+        registry = HostClientRegistry(host_state)
+        server = AgentServer(
+            host_config,
+            host_backend,
+            host_state,
+            host_registry=registry,
+            clipboard=host_clipboard,
+        )
+        await server.start()
+        assert server._server is not None
+        port = server._server.sockets[0].getsockname()[1]
+
+        client_config = AppConfig(
+            machine_name="client",
+            pairing_secret="secret",
+            clipboard_poll_seconds=0.05,
+        )
+        client_backend = NullBackend()
+        client_clipboard = NullClipboard("initial client")
+        client_state = StateStore("client", client_backend.name)
+        connector = ClientConnector(
+            config=client_config,
+            backend=client_backend,
+            state=client_state,
+            host="127.0.0.1",
+            port=port,
+            retry_seconds=0.05,
+            clipboard=client_clipboard,
+        )
+
+        try:
+            await connector.start()
+            await self._wait_for_hosted_client(registry, "client")
+            image = b"\x89PNG\r\n\x1a\nhost-image"
+            host_clipboard.set_image_png(image)
+            await self._wait_for_clipboard_image(client_clipboard, image)
+        finally:
+            await connector.stop()
+            await server.stop()
+
     async def test_client_connection_exits_when_heartbeat_fails(self) -> None:
         host_config = AppConfig(
             machine_name="host",
@@ -261,6 +367,13 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
                 return
             await asyncio.sleep(0.05)
         self.fail(f"clipboard did not become {expected!r}")
+
+    async def _wait_for_clipboard_image(self, clipboard: NullClipboard, expected: bytes) -> None:
+        for _ in range(60):
+            if clipboard.get_image_png() == expected:
+                return
+            await asyncio.sleep(0.05)
+        self.fail("clipboard image did not sync")
 
     async def _wait_for_state(self, state: StateStore, key: str, expected=None) -> None:
         for _ in range(60):

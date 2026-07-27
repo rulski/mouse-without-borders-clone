@@ -7,7 +7,14 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from .clipboard import Clipboard, ClipboardError, truncate_text
+from .clipboard import (
+    Clipboard,
+    ClipboardError,
+    ClipboardPayload,
+    clipboard_payload_from_wire,
+    read_clipboard_payload,
+    write_clipboard_payload,
+)
 from .config import AppConfig, PeerConfig
 from .input_backend import InputBackend, apply_input_event
 from .protocol import AuthenticationError, Message, decode_message, decode_with_any_secret, encode_message
@@ -378,22 +385,21 @@ class AgentServer:
     async def _apply_clipboard_message(self, message: Message, source: str) -> None:
         if self.clipboard is None or not self.config.clipboard_enabled:
             return
-        if "text" not in message.payload:
-            raise ValueError("clipboard message missing text")
 
-        text = truncate_text(str(message.payload["text"]), self.config.clipboard_max_text_bytes)
-        await asyncio.to_thread(self.clipboard.set_text, text)
-        self._clipboard_last_seen = text
+        payload = clipboard_payload_from_wire(
+            message.payload,
+            self.config.clipboard_max_text_bytes,
+            self.config.clipboard_max_image_bytes,
+        )
+        await asyncio.to_thread(write_clipboard_payload, self.clipboard, payload)
+        self._clipboard_last_seen = payload.signature
         self.state.update(last_clipboard_source=source, last_clipboard_at=time.time())
-        await self._broadcast_clipboard(text, exclude=source)
+        await self._broadcast_clipboard(payload, exclude=source)
 
     async def _send_host_clipboard_changes(self) -> None:
         assert self.clipboard is not None
         try:
-            self._clipboard_last_seen = truncate_text(
-                await self._read_clipboard_text(),
-                self.config.clipboard_max_text_bytes,
-            )
+            self._clipboard_last_seen = (await self._read_clipboard_payload()).signature
         except ClipboardError as exc:
             self._clipboard_last_seen = ""
             self.state.update(clipboard_error=str(exc))
@@ -401,39 +407,38 @@ class AgentServer:
         while True:
             await asyncio.sleep(max(0.1, self.config.clipboard_poll_seconds))
             try:
-                text = truncate_text(
-                    await self._read_clipboard_text(),
-                    self.config.clipboard_max_text_bytes,
-                )
+                payload = await self._read_clipboard_payload()
             except ClipboardError as exc:
                 self.state.update(clipboard_error=str(exc))
                 continue
-            if text == self._clipboard_last_seen:
+            if payload.signature == self._clipboard_last_seen:
                 continue
-            self._clipboard_last_seen = text
-            await self._broadcast_clipboard(text)
+            self._clipboard_last_seen = payload.signature
+            await self._broadcast_clipboard(payload)
             self.state.update(
                 clipboard_error=None,
                 last_clipboard_source=self.config.machine_name,
                 last_clipboard_sent=time.time(),
             )
 
-    async def _read_clipboard_text(self) -> str:
+    async def _read_clipboard_payload(self) -> ClipboardPayload:
         assert self.clipboard is not None
-        return await asyncio.to_thread(self.clipboard.get_text)
+        return await asyncio.to_thread(
+            read_clipboard_payload,
+            self.clipboard,
+            self.config.clipboard_max_text_bytes,
+            self.config.clipboard_max_image_bytes,
+        )
 
-    async def _broadcast_clipboard(self, text: str, *, exclude: str | None = None) -> None:
+    async def _broadcast_clipboard(self, payload: ClipboardPayload, *, exclude: str | None = None) -> None:
         if self.host_registry is None or not self.config.clipboard_enabled:
             return
-        payload = {
-            "source": self.config.machine_name,
-            "text": truncate_text(text, self.config.clipboard_max_text_bytes),
-        }
+        wire_payload = payload.to_wire_payload(self.config.machine_name)
         for client in await self.host_registry.connected_clients():
             if exclude is not None and client.name == exclude:
                 continue
             try:
-                await client.send("clipboard", payload)
+                await client.send("clipboard", wire_payload)
             except Exception as exc:
                 logger.info("failed to send clipboard to %s: %s", client.name, exc)
                 self.state.update_peer(client.name, error=str(exc))
@@ -594,34 +599,31 @@ class ClientConnector:
     async def _send_clipboard_changes(self, writer: asyncio.StreamWriter, secret: str) -> None:
         assert self.clipboard is not None
         try:
-            self._clipboard_last_seen = truncate_text(
-                await self._read_clipboard_text(),
-                self.config.clipboard_max_text_bytes,
-            )
+            self._clipboard_last_seen = (await self._read_clipboard_payload()).signature
         except ClipboardError as exc:
             self._clipboard_last_seen = ""
             self.state.update(clipboard_error=str(exc))
         while self._running and not writer.is_closing():
             await asyncio.sleep(max(0.1, self.config.clipboard_poll_seconds))
             try:
-                text = await self._read_clipboard_text()
+                payload = await self._read_clipboard_payload()
             except ClipboardError as exc:
                 self.state.update(clipboard_error=str(exc))
                 continue
-            text = truncate_text(text, self.config.clipboard_max_text_bytes)
-            if text == self._clipboard_last_seen:
+            if payload.signature == self._clipboard_last_seen:
                 continue
-            self._clipboard_last_seen = text
-            payload = {
-                "source": self.config.machine_name,
-                "text": text,
-            }
-            await send_message(writer, "clipboard", payload, secret)
+            self._clipboard_last_seen = payload.signature
+            await send_message(writer, "clipboard", payload.to_wire_payload(self.config.machine_name), secret)
             self.state.update(clipboard_error=None, last_clipboard_sent=time.time())
 
-    async def _read_clipboard_text(self) -> str:
+    async def _read_clipboard_payload(self) -> ClipboardPayload:
         assert self.clipboard is not None
-        return await asyncio.to_thread(self.clipboard.get_text)
+        return await asyncio.to_thread(
+            read_clipboard_payload,
+            self.clipboard,
+            self.config.clipboard_max_text_bytes,
+            self.config.clipboard_max_image_bytes,
+        )
 
     async def _handle_host_message(self, message: Message) -> None:
         if message.type == "input":
@@ -633,9 +635,13 @@ class ClientConnector:
             self.state.update(host_active=self._host_active)
         elif message.type == "clipboard":
             if self.clipboard is not None and self.config.clipboard_enabled:
-                text = truncate_text(str(message.payload.get("text", "")), self.config.clipboard_max_text_bytes)
-                await asyncio.to_thread(self.clipboard.set_text, text)
-                self._clipboard_last_seen = text
+                payload = clipboard_payload_from_wire(
+                    message.payload,
+                    self.config.clipboard_max_text_bytes,
+                    self.config.clipboard_max_image_bytes,
+                )
+                await asyncio.to_thread(write_clipboard_payload, self.clipboard, payload)
+                self._clipboard_last_seen = payload.signature
                 self.state.update(last_clipboard_received=time.time())
         elif message.type == "settings":
             self._apply_settings(message.payload)

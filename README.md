@@ -13,7 +13,7 @@ It is an MVP, not a kernel-level input driver. Native input capture/injection is
 - Browser controller mode for locked-down devices that can open a web page but cannot run an executable.
 - Host layout editor for moving peer devices to the left, right, top, or bottom edge and controlling per-client features.
 - Host-controlled keep-awake mode for selected clients.
-- Bidirectional text clipboard sync between the host and always-looking clients.
+- Bidirectional text and image clipboard sync between the host and always-looking clients.
 - Pointer locking while remote control is active so relative motion can continue past the local screen edge.
 - Optional local event suppression while controlling a peer, when supported by the OS/backend.
 - Small local dashboard at `http://127.0.0.1:45446`.
@@ -68,7 +68,9 @@ Replace `192.168.1.10` with the host machine's LAN IP or DNS name. The client ke
 
 Move the host machine's pointer into a configured edge. For example, `--edge right` means the client is logically to the right of the host screen. Move left on the remote screen edge to return to the host.
 
-When a connected host or client copies plain text, MWBC syncs that text to the other side. For example, text copied on `MACBOOK` can be pasted on the Windows host, and text copied on the Windows host can be pasted on `MACBOOK`.
+When a connected host or client copies text or a supported clipboard image, MWBC syncs that clipboard item to the other side. For example, text or screenshots copied on `MACBOOK` can be pasted on the Windows host, and clipboard items copied on the Windows host can be pasted on `MACBOOK`.
+
+Images are sent as PNG payloads and capped by `clipboard_max_image_bytes` in `~/.mwbc/config.json`. The default cap is 8 MB.
 
 Press `F12` on the host to toggle host lock. When host lock is on, edge switching is paused so the mouse and keyboard stay on the host. If you press `F12` while controlling a client, MWBC returns control to the host immediately. Press `F12` again to resume edge switching.
 

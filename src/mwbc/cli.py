@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
-    VALID_EDGES,
     AppConfig,
     DEFAULT_CONFIG_PATH,
+    DEFAULT_CLIPBOARD_MAX_IMAGE_BYTES,
     PeerConfig,
+    VALID_EDGES,
     ensure_config,
     generate_secret,
     load_config,
@@ -383,6 +384,11 @@ def _capabilities_payload() -> dict[str, Any]:
             "secret_regeneration": True,
             "layout": True,
             "keep_awake": True,
+            "clipboard": {
+                "text": True,
+                "image": True,
+                "max_image_bytes": DEFAULT_CLIPBOARD_MAX_IMAGE_BYTES,
+            },
         },
         "logs": True,
     }

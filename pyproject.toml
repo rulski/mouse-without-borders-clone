@@ -13,7 +13,7 @@ license = { text = "MIT" }
 dependencies = []
 
 [project.optional-dependencies]
-input = ["pynput>=1.7.7"]
+input = ["pynput>=1.7.7", "Pillow>=10.0"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
@@ -21,4 +21,3 @@ mwbc = "mwbc.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
