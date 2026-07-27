@@ -370,9 +370,11 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             await self._wait_for_hosted_client(registry, "client")
             host_clipboard.set_image_png(b"\x89PNG\r\n\x1a\nhost-image")
             await self._wait_for_state(client_state, "clipboard_error", "pasteboard refused image")
+            await self._wait_for_state(host_state, "last_clipboard_ack_ok", False)
             await asyncio.sleep(0.2)
             self.assertTrue(client_state.snapshot()["host_connected"])
             self.assertIsNotNone(await registry.get("client"))
+            self.assertEqual(host_state.snapshot().get("last_clipboard_ack_error"), "pasteboard refused image")
         finally:
             await connector.stop()
             await server.stop()

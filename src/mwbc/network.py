@@ -31,6 +31,7 @@ LOCAL_CAPABILITIES: dict[str, Any] = {
         "text": True,
         "image": True,
         "image_error_isolation": True,
+        "image_receive_v2": True,
     }
 }
 
@@ -40,7 +41,7 @@ def _supports_clipboard_kind(capabilities: dict[str, Any], kind: str) -> bool:
     if not isinstance(clipboard, dict):
         return kind == "text"
     if kind == "image":
-        return bool(clipboard.get("image") and clipboard.get("image_error_isolation"))
+        return bool(clipboard.get("image") and clipboard.get("image_error_isolation") and clipboard.get("image_receive_v2"))
     return bool(clipboard.get(kind, kind == "text"))
 
 
@@ -395,6 +396,9 @@ class AgentServer:
                 if message.type == "clipboard":
                     await self._apply_clipboard_message(message, client.name)
                     continue
+                if message.type == "clipboard_ack":
+                    self._handle_clipboard_ack(message, client.name)
+                    continue
                 logger.debug("ignoring hosted client message type %s from %s", message.type, client.name)
         finally:
             if self.host_registry is not None:
@@ -438,6 +442,22 @@ class AgentServer:
             last_clipboard_bytes=_clipboard_payload_size(payload),
         )
         await self._broadcast_clipboard(payload, exclude=source)
+
+    def _handle_clipboard_ack(self, message: Message, source: str) -> None:
+        ok = bool(message.payload.get("ok", False))
+        error = str(message.payload.get("error") or "")
+        self.state.update(
+            last_clipboard_ack_peer=source,
+            last_clipboard_ack_ok=ok,
+            last_clipboard_ack_kind=message.payload.get("kind"),
+            last_clipboard_ack_bytes=message.payload.get("bytes"),
+            last_clipboard_ack_at=time.time(),
+            last_clipboard_ack_error=error or None,
+        )
+        if ok:
+            self.state.update_peer(source, error=None)
+            return
+        self.state.update_peer(source, error=error or "clipboard receive failed")
 
     async def _send_host_clipboard_changes(self) -> None:
         assert self.clipboard is not None
@@ -628,7 +648,10 @@ class ClientConnector:
             host_screen_width=ack.payload.get("screen_width"),
             host_screen_height=ack.payload.get("screen_height"),
         )
-        host_read_task = asyncio.create_task(self._read_host_messages(reader, secret), name="mwbc-client-host-reader")
+        host_read_task = asyncio.create_task(
+            self._read_host_messages(reader, writer, secret),
+            name="mwbc-client-host-reader",
+        )
         heartbeat_task = asyncio.create_task(self._send_heartbeats(writer, secret), name="mwbc-client-heartbeat")
         clipboard_task: asyncio.Task[None] | None = None
         keep_awake_task = asyncio.create_task(self._keep_awake_loop(), name="mwbc-client-keep-awake")
@@ -659,10 +682,15 @@ class ClientConnector:
             self._host_active = False
             self.state.update(host_connected=False, host_active=False)
 
-    async def _read_host_messages(self, reader: asyncio.StreamReader, secret: str) -> None:
+    async def _read_host_messages(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        secret: str,
+    ) -> None:
         while self._running:
             message = await read_message(reader, secret)
-            await self._handle_host_message(message)
+            await self._handle_host_message(message, writer, secret)
 
     async def _send_heartbeats(self, writer: asyncio.StreamWriter, secret: str) -> None:
         while self._running and not writer.is_closing():
@@ -721,7 +749,12 @@ class ClientConnector:
             self.config.clipboard_max_image_bytes,
         )
 
-    async def _handle_host_message(self, message: Message) -> None:
+    async def _handle_host_message(
+        self,
+        message: Message,
+        writer: asyncio.StreamWriter,
+        secret: str,
+    ) -> None:
         if message.type == "input":
             apply_input_event(self.backend, message.payload)
             self.state.increment("events_received")
@@ -731,6 +764,8 @@ class ClientConnector:
             self.state.update(host_active=self._host_active)
         elif message.type == "clipboard":
             if self.clipboard is not None and self.config.clipboard_enabled:
+                payload: ClipboardPayload | None = None
+                kind = str(message.payload.get("kind") or "text")
                 try:
                     payload = clipboard_payload_from_wire(
                         message.payload,
@@ -741,6 +776,7 @@ class ClientConnector:
                 except Exception as exc:
                     logger.info("failed to apply clipboard payload from host: %s", exc)
                     self.state.update(clipboard_error=str(exc))
+                    await self._send_clipboard_ack(writer, secret, kind=kind, ok=False, error=str(exc))
                     return
                 self._clipboard_last_seen = payload.signature
                 self.state.update(
@@ -749,12 +785,47 @@ class ClientConnector:
                     last_clipboard_kind=payload.kind,
                     last_clipboard_bytes=_clipboard_payload_size(payload),
                 )
+                await self._send_clipboard_ack(
+                    writer,
+                    secret,
+                    kind=payload.kind,
+                    ok=True,
+                    error="",
+                    size=_clipboard_payload_size(payload),
+                )
         elif message.type == "settings":
             self._apply_settings(message.payload)
         elif message.type == "heartbeat":
             return
         else:
             logger.warning("ignoring unknown host message type %s", message.type)
+
+    async def _send_clipboard_ack(
+        self,
+        writer: asyncio.StreamWriter,
+        secret: str,
+        *,
+        kind: str,
+        ok: bool,
+        error: str,
+        size: int | None = None,
+    ) -> None:
+        if writer.is_closing():
+            return
+        try:
+            await send_message(
+                writer,
+                "clipboard_ack",
+                {
+                    "kind": kind,
+                    "ok": ok,
+                    "error": error,
+                    "bytes": size,
+                },
+                secret,
+            )
+        except Exception as exc:
+            logger.info("failed to send clipboard acknowledgement: %s", exc)
 
     def _apply_settings(self, payload: dict[str, Any]) -> None:
         interval = float(payload.get("keep_awake_interval_seconds", 45.0))

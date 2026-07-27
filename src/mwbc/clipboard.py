@@ -351,18 +351,43 @@ def _macos_set_image_png(data: bytes) -> None:
     if image is None:
         raise ClipboardError("could not decode macOS clipboard image")
 
+    tiff_data = image.TIFFRepresentation()
+    png_types = _unique_pasteboard_types("public.png", _appkit_constant("NSPasteboardTypePNG", "public.png"))
+    tiff_types = _unique_pasteboard_types(
+        "public.tiff",
+        "NSTIFFPboardType",
+        _appkit_constant("NSPasteboardTypeTIFF", "public.tiff"),
+    )
+
+    pasteboard.clearContents()
+    pasteboard.declareTypes_owner_(png_types + tiff_types, None)
+
+    wrote = False
+    for paste_type in png_types:
+        wrote = bool(pasteboard.setData_forType_(nsdata, paste_type)) or wrote
+    if tiff_data is not None:
+        for paste_type in tiff_types:
+            wrote = bool(pasteboard.setData_forType_(tiff_data, paste_type)) or wrote
+    if wrote:
+        return
+
     pasteboard.clearContents()
     if pasteboard.writeObjects_([image]):
         return
-
-    tiff_data = image.TIFFRepresentation()
-    pasteboard.clearContents()
-    pasteboard.declareTypes_owner_(["public.png", "public.tiff"], None)
-    if pasteboard.setData_forType_(nsdata, "public.png"):
-        return
-    if tiff_data is not None and pasteboard.setData_forType_(tiff_data, "public.tiff"):
-        return
     raise ClipboardError("could not set macOS clipboard image")
+
+
+def _appkit_constant(name: str, fallback: str) -> str:
+    try:
+        import AppKit
+    except ImportError:
+        return fallback
+    value = getattr(AppKit, name, fallback)
+    return str(value)
+
+
+def _unique_pasteboard_types(*values: str) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
 
 
 def _windows_set_image_png(data: bytes) -> None:
