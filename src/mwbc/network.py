@@ -30,6 +30,7 @@ LOCAL_CAPABILITIES: dict[str, Any] = {
     "clipboard": {
         "text": True,
         "image": True,
+        "image_error_isolation": True,
     }
 }
 
@@ -38,6 +39,8 @@ def _supports_clipboard_kind(capabilities: dict[str, Any], kind: str) -> bool:
     clipboard = capabilities.get("clipboard")
     if not isinstance(clipboard, dict):
         return kind == "text"
+    if kind == "image":
+        return bool(clipboard.get("image") and clipboard.get("image_error_isolation"))
     return bool(clipboard.get(kind, kind == "text"))
 
 
@@ -422,7 +425,8 @@ class AgentServer:
                 self.config.clipboard_max_image_bytes,
             )
             await asyncio.to_thread(write_clipboard_payload, self.clipboard, payload)
-        except ClipboardError as exc:
+        except Exception as exc:
+            logger.info("failed to apply clipboard payload from %s: %s", source, exc)
             self.state.update(clipboard_error=str(exc))
             return
         self._clipboard_last_seen = payload.signature
@@ -500,6 +504,13 @@ class AgentServer:
             payload = await self._read_clipboard_payload()
         except ClipboardError as exc:
             self.state.update(clipboard_error=str(exc))
+            return
+        if payload.kind != "text":
+            self.state.update(
+                last_clipboard_deferred_peer=client.name,
+                last_clipboard_deferred_kind=payload.kind,
+                last_clipboard_deferred_at=time.time(),
+            )
             return
         if not _supports_clipboard_kind(client.capabilities, payload.kind):
             warning = f"{client.name} does not advertise {payload.kind} clipboard support"
@@ -727,7 +738,8 @@ class ClientConnector:
                         self.config.clipboard_max_image_bytes,
                     )
                     await asyncio.to_thread(write_clipboard_payload, self.clipboard, payload)
-                except ClipboardError as exc:
+                except Exception as exc:
+                    logger.info("failed to apply clipboard payload from host: %s", exc)
                     self.state.update(clipboard_error=str(exc))
                     return
                 self._clipboard_last_seen = payload.signature

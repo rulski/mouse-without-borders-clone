@@ -10,6 +10,11 @@ from mwbc.network import AgentServer, ClientConnector, HostClientRegistry
 from mwbc.state import StateStore
 
 
+class RejectingImageClipboard(NullClipboard):
+    def set_image_png(self, data: bytes) -> None:
+        raise RuntimeError("pasteboard refused image")
+
+
 class NetworkTests(unittest.IsolatedAsyncioTestCase):
     async def test_always_looking_client_receives_host_input(self) -> None:
         host_config = AppConfig(
@@ -259,6 +264,115 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             image = b"\x89PNG\r\n\x1a\nhost-image"
             host_clipboard.set_image_png(image)
             await self._wait_for_clipboard_image(client_clipboard, image)
+        finally:
+            await connector.stop()
+            await server.stop()
+
+    async def test_host_does_not_send_current_image_on_client_connect(self) -> None:
+        host_config = AppConfig(
+            machine_name="host",
+            pairing_secret="secret",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            clipboard_poll_seconds=0.05,
+            peers=[PeerConfig(name="client", edge="right")],
+        )
+        host_backend = NullBackend()
+        host_clipboard = NullClipboard(image_png=b"\x89PNG\r\n\x1a\nexisting-image")
+        host_state = StateStore("host", host_backend.name)
+        host_state.register_peer("client", "", 45445, "right")
+        registry = HostClientRegistry(host_state)
+        server = AgentServer(
+            host_config,
+            host_backend,
+            host_state,
+            host_registry=registry,
+            clipboard=host_clipboard,
+        )
+        await server.start()
+        assert server._server is not None
+        port = server._server.sockets[0].getsockname()[1]
+
+        client_config = AppConfig(
+            machine_name="client",
+            pairing_secret="secret",
+            clipboard_poll_seconds=0.05,
+        )
+        client_backend = NullBackend()
+        client_clipboard = NullClipboard("initial client")
+        client_state = StateStore("client", client_backend.name)
+        connector = ClientConnector(
+            config=client_config,
+            backend=client_backend,
+            state=client_state,
+            host="127.0.0.1",
+            port=port,
+            retry_seconds=0.05,
+            clipboard=client_clipboard,
+        )
+
+        try:
+            await connector.start()
+            await self._wait_for_hosted_client(registry, "client")
+            await asyncio.sleep(0.2)
+            self.assertIsNone(client_clipboard.get_image_png())
+            self.assertEqual(client_clipboard.get_text(), "initial client")
+            self.assertEqual(host_state.snapshot().get("last_clipboard_deferred_kind"), "image")
+        finally:
+            await connector.stop()
+            await server.stop()
+
+    async def test_client_clipboard_image_failure_keeps_connection_alive(self) -> None:
+        host_config = AppConfig(
+            machine_name="host",
+            pairing_secret="secret",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            clipboard_poll_seconds=0.05,
+            peers=[PeerConfig(name="client", edge="right")],
+        )
+        host_backend = NullBackend()
+        host_clipboard = NullClipboard("initial host")
+        host_state = StateStore("host", host_backend.name)
+        host_state.register_peer("client", "", 45445, "right")
+        registry = HostClientRegistry(host_state)
+        server = AgentServer(
+            host_config,
+            host_backend,
+            host_state,
+            host_registry=registry,
+            clipboard=host_clipboard,
+        )
+        await server.start()
+        assert server._server is not None
+        port = server._server.sockets[0].getsockname()[1]
+
+        client_config = AppConfig(
+            machine_name="client",
+            pairing_secret="secret",
+            clipboard_poll_seconds=0.05,
+        )
+        client_backend = NullBackend()
+        client_clipboard = RejectingImageClipboard("initial client")
+        client_state = StateStore("client", client_backend.name)
+        connector = ClientConnector(
+            config=client_config,
+            backend=client_backend,
+            state=client_state,
+            host="127.0.0.1",
+            port=port,
+            retry_seconds=0.05,
+            clipboard=client_clipboard,
+        )
+
+        try:
+            await connector.start()
+            await self._wait_for_hosted_client(registry, "client")
+            host_clipboard.set_image_png(b"\x89PNG\r\n\x1a\nhost-image")
+            await self._wait_for_state(client_state, "clipboard_error", "pasteboard refused image")
+            await asyncio.sleep(0.2)
+            self.assertTrue(client_state.snapshot()["host_connected"])
+            self.assertIsNotNone(await registry.get("client"))
         finally:
             await connector.stop()
             await server.stop()
