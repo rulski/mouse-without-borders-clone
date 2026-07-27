@@ -26,12 +26,15 @@ MessageHandler = Callable[[Message, str], Awaitable[None]]
 CONNECT_TIMEOUT_SECONDS = 10.0
 HEARTBEAT_INTERVAL_SECONDS = 3.0
 HEARTBEAT_SEND_TIMEOUT_SECONDS = 5.0
+MIN_STREAM_FRAME_LIMIT_BYTES = 1_048_576
+STREAM_FRAME_OVERHEAD_BYTES = 262_144
 LOCAL_CAPABILITIES: dict[str, Any] = {
     "clipboard": {
         "text": True,
         "image": True,
         "image_error_isolation": True,
         "image_receive_v2": True,
+        "large_frames": True,
     }
 }
 
@@ -41,7 +44,12 @@ def _supports_clipboard_kind(capabilities: dict[str, Any], kind: str) -> bool:
     if not isinstance(clipboard, dict):
         return kind == "text"
     if kind == "image":
-        return bool(clipboard.get("image") and clipboard.get("image_error_isolation") and clipboard.get("image_receive_v2"))
+        return bool(
+            clipboard.get("image")
+            and clipboard.get("image_error_isolation")
+            and clipboard.get("image_receive_v2")
+            and clipboard.get("large_frames")
+        )
     return bool(clipboard.get(kind, kind == "text"))
 
 
@@ -49,6 +57,15 @@ def _clipboard_payload_size(payload: ClipboardPayload) -> int:
     if payload.kind == "image":
         return len(payload.data)
     return len(payload.text.encode("utf-8"))
+
+
+def _stream_frame_limit(config: AppConfig) -> int:
+    # Clipboard images are base64 encoded inside one signed JSON-line frame.
+    image_wire_bytes = ((max(0, config.clipboard_max_image_bytes) + 2) // 3) * 4
+    return max(
+        MIN_STREAM_FRAME_LIMIT_BYTES,
+        image_wire_bytes + max(0, config.clipboard_max_text_bytes) + STREAM_FRAME_OVERHEAD_BYTES,
+    )
 
 
 async def send_message(
@@ -113,7 +130,11 @@ class RemoteClient:
         if not self.peer.host:
             raise ConnectionError(f"{self.peer.name} has no direct host address; waiting for it to connect")
 
-        reader, writer = await asyncio.open_connection(self.peer.host, self.peer.port)
+        reader, writer = await asyncio.open_connection(
+            self.peer.host,
+            self.peer.port,
+            limit=_stream_frame_limit(self.config),
+        )
         self.reader = reader
         self.writer = writer
         width, height = self.backend.screen_size()
@@ -275,7 +296,12 @@ class AgentServer:
         self._clipboard_last_seen: str | None = None
 
     async def start(self) -> None:
-        self._server = await asyncio.start_server(self._handle_client, self.config.listen_host, self.config.listen_port)
+        self._server = await asyncio.start_server(
+            self._handle_client,
+            self.config.listen_host,
+            self.config.listen_port,
+            limit=_stream_frame_limit(self.config),
+        )
         sockets = ", ".join(str(sock.getsockname()) for sock in (self._server.sockets or []))
         logger.info("agent listening on %s", sockets)
         if (
@@ -619,7 +645,11 @@ class ClientConnector:
 
     async def _connect_once(self) -> None:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(self.host, self.port),
+            asyncio.open_connection(
+                self.host,
+                self.port,
+                limit=_stream_frame_limit(self.config),
+            ),
             timeout=CONNECT_TIMEOUT_SECONDS,
         )
         secret = self.config.pairing_secret

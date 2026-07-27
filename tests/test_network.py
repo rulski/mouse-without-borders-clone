@@ -208,7 +208,7 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         try:
             await connector.start()
             await self._wait_for_hosted_client(registry, "client")
-            image = b"\x89PNG\r\n\x1a\nclient-image"
+            image = b"\x89PNG\r\n\x1a\nclient-image" + (b"x" * 90_000)
             client_clipboard.set_image_png(image)
             await self._wait_for_clipboard_image(host_clipboard, image)
         finally:
@@ -261,7 +261,7 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         try:
             await connector.start()
             await self._wait_for_hosted_client(registry, "client")
-            image = b"\x89PNG\r\n\x1a\nhost-image"
+            image = b"\x89PNG\r\n\x1a\nhost-image" + (b"x" * 90_000)
             host_clipboard.set_image_png(image)
             await self._wait_for_clipboard_image(client_clipboard, image)
         finally:
