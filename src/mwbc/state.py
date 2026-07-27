@@ -17,6 +17,7 @@ class PeerStatus:
     screen_height: int | None = None
     last_seen: float | None = None
     error: str | None = None
+    capabilities: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -29,6 +30,7 @@ class PeerStatus:
             "screen_height": self.screen_height,
             "last_seen": self.last_seen,
             "error": self.error,
+            "capabilities": self.capabilities,
         }
 
 

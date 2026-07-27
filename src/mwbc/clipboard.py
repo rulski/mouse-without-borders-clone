@@ -347,11 +347,20 @@ def _macos_set_image_png(data: bytes) -> None:
 
     pasteboard = NSPasteboard.generalPasteboard()
     nsdata = NSData.dataWithBytes_length_(data, len(data))
-    pasteboard.clearContents()
     image = NSImage.alloc().initWithData_(nsdata)
-    if image is not None and image.writeToPasteboard_(pasteboard):
+    if image is None:
+        raise ClipboardError("could not decode macOS clipboard image")
+
+    pasteboard.clearContents()
+    if pasteboard.writeObjects_([image]):
         return
+
+    tiff_data = image.TIFFRepresentation()
+    pasteboard.clearContents()
+    pasteboard.declareTypes_owner_(["public.png", "public.tiff"], None)
     if pasteboard.setData_forType_(nsdata, "public.png"):
+        return
+    if tiff_data is not None and pasteboard.setData_forType_(tiff_data, "public.tiff"):
         return
     raise ClipboardError("could not set macOS clipboard image")
 

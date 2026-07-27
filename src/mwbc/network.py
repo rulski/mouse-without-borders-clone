@@ -26,6 +26,25 @@ MessageHandler = Callable[[Message, str], Awaitable[None]]
 CONNECT_TIMEOUT_SECONDS = 10.0
 HEARTBEAT_INTERVAL_SECONDS = 3.0
 HEARTBEAT_SEND_TIMEOUT_SECONDS = 5.0
+LOCAL_CAPABILITIES: dict[str, Any] = {
+    "clipboard": {
+        "text": True,
+        "image": True,
+    }
+}
+
+
+def _supports_clipboard_kind(capabilities: dict[str, Any], kind: str) -> bool:
+    clipboard = capabilities.get("clipboard")
+    if not isinstance(clipboard, dict):
+        return kind == "text"
+    return bool(clipboard.get(kind, kind == "text"))
+
+
+def _clipboard_payload_size(payload: ClipboardPayload) -> int:
+    if payload.kind == "image":
+        return len(payload.data)
+    return len(payload.text.encode("utf-8"))
 
 
 async def send_message(
@@ -102,6 +121,7 @@ class RemoteClient:
                 "screen_width": width,
                 "screen_height": height,
                 "client_version": "0.1.0",
+                "capabilities": LOCAL_CAPABILITIES,
             },
             self._secret,
         )
@@ -148,6 +168,7 @@ class HostedRemoteClient:
         secret: str,
         remote_screen: RemoteScreen,
         state: StateStore,
+        capabilities: dict[str, Any] | None = None,
     ) -> None:
         self.name = name
         self.reader = reader
@@ -155,6 +176,7 @@ class HostedRemoteClient:
         self._secret = secret
         self.remote_screen = remote_screen
         self.state = state
+        self.capabilities = capabilities or {}
 
     @property
     def connected(self) -> bool:
@@ -201,6 +223,7 @@ class HostClientRegistry:
             screen_height=client.remote_screen.height,
             last_seen=time.time(),
             error=None,
+            capabilities=client.capabilities,
         )
 
     async def unregister(self, name: str, client: HostedRemoteClient) -> None:
@@ -297,6 +320,9 @@ class AgentServer:
 
             client_name = str(hello.payload.get("machine_name", peername))
             role = str(hello.payload.get("role", "controller"))
+            capabilities = hello.payload.get("capabilities")
+            if not isinstance(capabilities, dict):
+                capabilities = {}
             incoming_key = f"{client_name} {peername}"
             self.state.update_incoming(
                 incoming_key,
@@ -305,6 +331,7 @@ class AgentServer:
                 connected=True,
                 screen_width=hello.payload.get("screen_width"),
                 screen_height=hello.payload.get("screen_height"),
+                capabilities=capabilities,
                 last_seen=time.time(),
             )
 
@@ -331,9 +358,11 @@ class AgentServer:
                     secret=secret,
                     remote_screen=_screen_from_payload(hello.payload),
                     state=self.state,
+                    capabilities=capabilities,
                 )
                 await self.host_registry.register(hosted_client)
                 await self._send_client_settings(hosted_client)
+                await self._send_current_clipboard_to_client(hosted_client)
                 await self._monitor_hosted_client(hosted_client, incoming_key)
                 return
 
@@ -386,14 +415,24 @@ class AgentServer:
         if self.clipboard is None or not self.config.clipboard_enabled:
             return
 
-        payload = clipboard_payload_from_wire(
-            message.payload,
-            self.config.clipboard_max_text_bytes,
-            self.config.clipboard_max_image_bytes,
-        )
-        await asyncio.to_thread(write_clipboard_payload, self.clipboard, payload)
+        try:
+            payload = clipboard_payload_from_wire(
+                message.payload,
+                self.config.clipboard_max_text_bytes,
+                self.config.clipboard_max_image_bytes,
+            )
+            await asyncio.to_thread(write_clipboard_payload, self.clipboard, payload)
+        except ClipboardError as exc:
+            self.state.update(clipboard_error=str(exc))
+            return
         self._clipboard_last_seen = payload.signature
-        self.state.update(last_clipboard_source=source, last_clipboard_at=time.time())
+        self.state.update(
+            clipboard_error=None,
+            last_clipboard_source=source,
+            last_clipboard_at=time.time(),
+            last_clipboard_kind=payload.kind,
+            last_clipboard_bytes=_clipboard_payload_size(payload),
+        )
         await self._broadcast_clipboard(payload, exclude=source)
 
     async def _send_host_clipboard_changes(self) -> None:
@@ -419,6 +458,8 @@ class AgentServer:
                 clipboard_error=None,
                 last_clipboard_source=self.config.machine_name,
                 last_clipboard_sent=time.time(),
+                last_clipboard_kind=payload.kind,
+                last_clipboard_bytes=_clipboard_payload_size(payload),
             )
 
     async def _read_clipboard_payload(self) -> ClipboardPayload:
@@ -437,11 +478,49 @@ class AgentServer:
         for client in await self.host_registry.connected_clients():
             if exclude is not None and client.name == exclude:
                 continue
+            if not _supports_clipboard_kind(client.capabilities, payload.kind):
+                warning = f"{client.name} does not advertise {payload.kind} clipboard support"
+                self.state.update_peer(
+                    client.name,
+                    error=warning,
+                )
+                self.state.update(clipboard_error=warning)
+                continue
             try:
                 await client.send("clipboard", wire_payload)
+                self.state.update_peer(client.name, error=None)
             except Exception as exc:
                 logger.info("failed to send clipboard to %s: %s", client.name, exc)
                 self.state.update_peer(client.name, error=str(exc))
+
+    async def _send_current_clipboard_to_client(self, client: HostedRemoteClient) -> None:
+        if self.clipboard is None or not self.config.clipboard_enabled:
+            return
+        try:
+            payload = await self._read_clipboard_payload()
+        except ClipboardError as exc:
+            self.state.update(clipboard_error=str(exc))
+            return
+        if not _supports_clipboard_kind(client.capabilities, payload.kind):
+            warning = f"{client.name} does not advertise {payload.kind} clipboard support"
+            self.state.update_peer(
+                client.name,
+                error=warning,
+            )
+            self.state.update(clipboard_error=warning)
+            return
+        try:
+            await client.send("clipboard", payload.to_wire_payload(self.config.machine_name))
+            self.state.update(
+                clipboard_error=None,
+                last_clipboard_source=self.config.machine_name,
+                last_clipboard_sent=time.time(),
+                last_clipboard_kind=payload.kind,
+                last_clipboard_bytes=_clipboard_payload_size(payload),
+            )
+        except Exception as exc:
+            logger.info("failed to send current clipboard to %s: %s", client.name, exc)
+            self.state.update_peer(client.name, error=str(exc))
 
     async def _send_client_settings(self, client: HostedRemoteClient) -> None:
         settings = {
@@ -523,6 +602,7 @@ class ClientConnector:
                 "screen_width": width,
                 "screen_height": height,
                 "client_version": "0.1.0",
+                "capabilities": LOCAL_CAPABILITIES,
             },
             secret,
         )
@@ -614,7 +694,12 @@ class ClientConnector:
                 continue
             self._clipboard_last_seen = payload.signature
             await send_message(writer, "clipboard", payload.to_wire_payload(self.config.machine_name), secret)
-            self.state.update(clipboard_error=None, last_clipboard_sent=time.time())
+            self.state.update(
+                clipboard_error=None,
+                last_clipboard_sent=time.time(),
+                last_clipboard_kind=payload.kind,
+                last_clipboard_bytes=_clipboard_payload_size(payload),
+            )
 
     async def _read_clipboard_payload(self) -> ClipboardPayload:
         assert self.clipboard is not None
@@ -635,14 +720,23 @@ class ClientConnector:
             self.state.update(host_active=self._host_active)
         elif message.type == "clipboard":
             if self.clipboard is not None and self.config.clipboard_enabled:
-                payload = clipboard_payload_from_wire(
-                    message.payload,
-                    self.config.clipboard_max_text_bytes,
-                    self.config.clipboard_max_image_bytes,
-                )
-                await asyncio.to_thread(write_clipboard_payload, self.clipboard, payload)
+                try:
+                    payload = clipboard_payload_from_wire(
+                        message.payload,
+                        self.config.clipboard_max_text_bytes,
+                        self.config.clipboard_max_image_bytes,
+                    )
+                    await asyncio.to_thread(write_clipboard_payload, self.clipboard, payload)
+                except ClipboardError as exc:
+                    self.state.update(clipboard_error=str(exc))
+                    return
                 self._clipboard_last_seen = payload.signature
-                self.state.update(last_clipboard_received=time.time())
+                self.state.update(
+                    clipboard_error=None,
+                    last_clipboard_received=time.time(),
+                    last_clipboard_kind=payload.kind,
+                    last_clipboard_bytes=_clipboard_payload_size(payload),
+                )
         elif message.type == "settings":
             self._apply_settings(message.payload)
         elif message.type == "heartbeat":
