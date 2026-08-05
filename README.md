@@ -17,6 +17,7 @@ It is an MVP, not a kernel-level input driver. Native input capture/injection is
 - Pointer locking while remote control is active so relative motion can continue past the local screen edge.
 - Optional local event suppression while controlling a peer, when supported by the OS/backend.
 - Small local dashboard at `http://127.0.0.1:45446`.
+- Optional tray/menu bar companion for service status, connected devices, host lock state, and quick controls.
 - Null backend for safe dry runs and tests.
 
 ## Install
@@ -26,6 +27,12 @@ cd /home/rulski/Projects/mouse-without-borders-clone
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e ".[input]"
+```
+
+To include the tray/menu bar companion:
+
+```bash
+pip install -e ".[input,tray]"
 ```
 
 For a dry run without native hooks:
@@ -73,6 +80,18 @@ When a connected host or client copies text or a supported clipboard image, MWBC
 Images are sent as PNG payloads and capped by `clipboard_max_image_bytes` in `~/.mwbc/config.json`. The default cap is 8 MB.
 
 Press `F12` on the host to toggle host lock. When host lock is on, edge switching is paused so the mouse and keyboard stay on the host. If you press `F12` while controlling a client, MWBC returns control to the host immediately. Press `F12` again to resume edge switching.
+
+## Tray/Menu Bar Companion
+
+Run the optional tray companion on the same machine as the MWBC host:
+
+```bash
+mwbc tray --smith-url http://localhost:3000/mwbc
+```
+
+The tray icon shows whether MWBC is offline, running, connected to devices, or locked to the host with `F12`. Its menu can open Smith Command Center, the MWBC dashboard, the layout editor, and the web controller. It can also start the host when MWBC is stopped, or stop/restart the running local daemon.
+
+The tray is intentionally separate from the daemon. That means it can stay open and offer `Start Host` even when the main MWBC process is not running.
 
 ## Layout Editor
 
@@ -279,6 +298,7 @@ mwbc run
 mwbc run --dashboard-host 0.0.0.0
 mwbc agent
 mwbc controller
+mwbc tray --smith-url http://localhost:3000/mwbc
 mwbc startup install --mode client --host 192.168.1.10
 mwbc startup install --mode host
 mwbc startup status

@@ -79,6 +79,14 @@ def build_parser() -> argparse.ArgumentParser:
     client.add_argument("--retry-seconds", type=float, default=1.0, help="Reconnect delay.")
     client.add_argument("--backend", choices=["auto", "pynput", "null"], help="Override configured backend.")
 
+    tray = subparsers.add_parser("tray", help="Run the system tray/menu bar companion.")
+    tray.add_argument("--api-url", default="http://127.0.0.1:45446", help="Local MWBC dashboard API URL.")
+    tray.add_argument("--smith-url", default="http://localhost:3000/mwbc", help="Smith MWBC module URL.")
+    tray.add_argument("--token", help="Dashboard API token. Defaults to the configured pairing secret.")
+    tray.add_argument("--poll-seconds", type=float, default=2.0, help="How often to refresh tray status.")
+    tray.add_argument("--start-mode", choices=["host", "run"], default="host", help="Mode used by Start Host.")
+    tray.add_argument("--start-backend", choices=["auto", "pynput", "null"], help="Backend used by Start Host.")
+
     startup = subparsers.add_parser("startup", help="Manage per-user startup registration.")
     startup_subparsers = startup.add_subparsers(dest="startup_command", required=True)
 
@@ -117,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_add_peer(args)
     if args.command == "startup":
         return cmd_startup(args)
+    if args.command == "tray":
+        from .tray import cmd_tray
+
+        return cmd_tray(args)
     if args.command in {"run", "agent", "controller", "host", "client"}:
         return asyncio.run(cmd_run(args))
 
