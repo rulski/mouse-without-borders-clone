@@ -247,12 +247,19 @@ class TrayApp:
         else:
             fill = (230, 165, 35, 255)
         draw.rounded_rectangle((6, 6, 58, 58), radius=12, fill=fill)
-        draw.rectangle((18, 16, 46, 37), fill=(255, 255, 255, 240))
-        draw.rectangle((29, 38, 35, 48), fill=(255, 255, 255, 240))
-        draw.rectangle((22, 49, 42, 53), fill=(255, 255, 255, 240))
-        if snapshot.host_lock:
-            draw.arc((20, 20, 44, 46), 200, -20, fill=fill, width=4)
-            draw.rectangle((20, 33, 44, 50), fill=fill)
+        foreground = (255, 255, 255, 245)
+        shadow = (20, 24, 32, 80)
+        screen = tuple(max(0, channel - 36) for channel in fill[:3]) + (255,)
+
+        draw.rounded_rectangle((11, 14, 43, 37), radius=4, fill=foreground)
+        draw.rounded_rectangle((15, 18, 39, 32), radius=2, fill=screen)
+        draw.rectangle((25, 38, 30, 45), fill=foreground)
+        draw.rounded_rectangle((19, 46, 36, 51), radius=2, fill=foreground)
+
+        draw.line((39, 30, 47, 31, 50, 35), fill=foreground, width=2)
+        draw.rounded_rectangle((43, 34, 56, 52), radius=7, fill=foreground)
+        draw.line((49, 36, 49, 43), fill=screen, width=1)
+        draw.line((43, 43, 56, 43), fill=shadow, width=1)
         return image
 
     def _title(self, snapshot: TraySnapshot) -> str:
