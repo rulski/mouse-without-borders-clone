@@ -15,6 +15,7 @@ APP_ID = "com.localcodex.mwbc"
 APP_NAME = "MWBC"
 WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 MACOS_LAUNCH_AGENT = f"{APP_ID}.plist"
+STARTUP_MODES = {"run", "agent", "controller", "host", "client", "tray"}
 
 
 class StartupError(RuntimeError):
@@ -34,6 +35,11 @@ class StartupOptions:
     backend: str | None = None
     log_level: str = "INFO"
     keep_alive: bool = False
+    api_url: str | None = None
+    smith_url: str | None = None
+    poll_seconds: float | None = None
+    tray_start_mode: str = "host"
+    tray_start_backend: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,10 +85,12 @@ def startup_status() -> StartupStatus:
 
 
 def build_startup_argv(options: StartupOptions) -> list[str]:
-    if options.mode not in {"run", "agent", "controller", "host", "client"}:
-        raise StartupError("startup mode must be run, agent, controller, host, or client")
+    if options.mode not in STARTUP_MODES:
+        raise StartupError("startup mode must be run, agent, controller, host, client, or tray")
     if options.mode == "client" and not options.host:
         raise StartupError("client startup mode requires --host")
+    if options.mode == "tray" and options.tray_start_mode not in {"host", "run"}:
+        raise StartupError("tray startup start mode must be host or run")
 
     argv = [_startup_executable()]
     if not getattr(sys, "frozen", False):
@@ -96,6 +104,20 @@ def build_startup_argv(options: StartupOptions) -> list[str]:
             options.mode,
         ]
     )
+    if options.mode == "tray":
+        if options.api_url:
+            argv.extend(["--api-url", options.api_url])
+        if options.smith_url:
+            argv.extend(["--smith-url", options.smith_url])
+        if options.poll_seconds is not None:
+            argv.extend(["--poll-seconds", str(options.poll_seconds)])
+        if options.tray_start_mode != "host":
+            argv.extend(["--start-mode", options.tray_start_mode])
+        tray_start_backend = options.tray_start_backend or options.backend
+        if tray_start_backend:
+            argv.extend(["--start-backend", tray_start_backend])
+        return argv
+
     if options.mode == "client":
         assert options.host is not None
         argv.extend(["--host", options.host, "--port", str(options.port)])

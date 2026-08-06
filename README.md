@@ -216,6 +216,12 @@ For a host machine that should run at login:
 mwbc startup install --mode host
 ```
 
+For a host machine where the tray icon should run at login and let you start/stop MWBC from the notification area:
+
+```bash
+mwbc startup install --mode tray --smith-url http://localhost:3000/mwbc --tray-start-backend pynput
+```
+
 For a controller-only machine:
 
 ```bash
@@ -301,6 +307,7 @@ mwbc controller
 mwbc tray --smith-url http://localhost:3000/mwbc
 mwbc startup install --mode client --host 192.168.1.10
 mwbc startup install --mode host
+mwbc startup install --mode tray --smith-url http://localhost:3000/mwbc --tray-start-backend pynput
 mwbc startup status
 mwbc startup uninstall
 ```

@@ -71,6 +71,44 @@ class StartupTests(unittest.TestCase):
         self.assertIn("--retry-seconds", argv)
         self.assertIn("0.5", argv)
 
+    def test_build_tray_startup_argv(self) -> None:
+        argv = build_startup_argv(
+            StartupOptions(
+                mode="tray",
+                config_path=Path("/tmp/config.json"),
+                smith_url="http://localhost:3000/mwbc",
+                poll_seconds=3.0,
+                tray_start_backend="pynput",
+            )
+        )
+
+        self.assertIn("tray", argv)
+        self.assertIn("--smith-url", argv)
+        self.assertIn("http://localhost:3000/mwbc", argv)
+        self.assertIn("--poll-seconds", argv)
+        self.assertIn("3.0", argv)
+        self.assertIn("--start-backend", argv)
+        self.assertIn("pynput", argv)
+        self.assertNotIn("--backend", argv)
+
+    def test_build_tray_startup_argv_can_use_run_start_mode(self) -> None:
+        argv = build_startup_argv(
+            StartupOptions(
+                mode="tray",
+                config_path=Path("/tmp/config.json"),
+                api_url="http://127.0.0.1:45446",
+                tray_start_mode="run",
+                backend="pynput",
+            )
+        )
+
+        self.assertIn("--api-url", argv)
+        self.assertIn("http://127.0.0.1:45446", argv)
+        self.assertIn("--start-mode", argv)
+        self.assertIn("run", argv)
+        self.assertIn("--start-backend", argv)
+        self.assertIn("pynput", argv)
+
     def test_frozen_startup_argv_uses_executable_directly(self) -> None:
         with patch.object(sys, "frozen", True, create=True):
             argv = build_startup_argv(StartupOptions(mode="agent", config_path=Path("/tmp/config.json")))

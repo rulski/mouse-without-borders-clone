@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     startup_subparsers = startup.add_subparsers(dest="startup_command", required=True)
 
     startup_install = startup_subparsers.add_parser("install", help="Launch MWBC automatically when you sign in.")
-    startup_install.add_argument("--mode", choices=["run", "agent", "controller", "host", "client"], default="run")
+    startup_install.add_argument("--mode", choices=["run", "agent", "controller", "host", "client", "tray"], default="run")
     startup_install.add_argument("--backend", choices=["auto", "pynput", "null"], help="Override configured backend.")
     startup_install.add_argument("--host", help="Host IP/hostname when mode is client.")
     startup_install.add_argument("--port", type=int, default=45445, help="Host TCP port when mode is client.")
@@ -99,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
     startup_install.add_argument("--no-dashboard", action="store_true", help="Disable dashboard when mode is run or host.")
     startup_install.add_argument("--dashboard-host", help="Dashboard bind host when mode is run or host.")
     startup_install.add_argument("--dashboard-port", type=int, help="Dashboard port when mode is run or host.")
+    startup_install.add_argument("--api-url", help="Dashboard API URL when mode is tray.")
+    startup_install.add_argument("--smith-url", help="Smith MWBC module URL when mode is tray.")
+    startup_install.add_argument("--poll-seconds", type=float, help="Tray refresh interval when mode is tray.")
+    startup_install.add_argument("--tray-start-mode", choices=["host", "run"], default="host", help="Mode used by the tray's Start Host action.")
+    startup_install.add_argument("--tray-start-backend", choices=["auto", "pynput", "null"], help="Backend used by the tray's Start Host action.")
     startup_install.add_argument("--keep-alive", action="store_true", help="On macOS, restart after unexpected exit.")
 
     startup_subparsers.add_parser("uninstall", help="Remove MWBC from startup.")
@@ -182,6 +187,11 @@ def cmd_startup(args: argparse.Namespace) -> int:
                     backend=args.backend,
                     log_level=args.log_level,
                     keep_alive=args.keep_alive,
+                    api_url=args.api_url,
+                    smith_url=args.smith_url,
+                    poll_seconds=args.poll_seconds,
+                    tray_start_mode=args.tray_start_mode,
+                    tray_start_backend=args.tray_start_backend,
                 )
             )
             _print_startup_status(status, verb="Installed")
@@ -429,8 +439,8 @@ def _startup_status_payload(status) -> dict[str, Any]:
 
 def _startup_options_from_payload(config: AppConfig, args: argparse.Namespace, payload: dict[str, Any]) -> StartupOptions:
     mode = str(payload.get("mode") or getattr(args, "command", "host"))
-    if mode not in {"run", "agent", "controller", "host", "client"}:
-        raise ValueError("startup mode must be run, agent, controller, host, or client")
+    if mode not in {"run", "agent", "controller", "host", "client", "tray"}:
+        raise ValueError("startup mode must be run, agent, controller, host, client, or tray")
     host = payload.get("host")
     if host is None:
         host = getattr(args, "host", None)
@@ -446,6 +456,15 @@ def _startup_options_from_payload(config: AppConfig, args: argparse.Namespace, p
         backend=payload.get("backend") or getattr(args, "backend", None),
         log_level=str(payload.get("log_level", getattr(args, "log_level", "INFO"))),
         keep_alive=bool(payload.get("keep_alive", False)),
+        api_url=str(payload.get("api_url")) if payload.get("api_url") else None,
+        smith_url=str(payload.get("smith_url")) if payload.get("smith_url") else None,
+        poll_seconds=float(payload["poll_seconds"]) if payload.get("poll_seconds") is not None else None,
+        tray_start_mode=str(payload.get("tray_start_mode") or payload.get("start_mode") or "host"),
+        tray_start_backend=(
+            str(payload.get("tray_start_backend") or payload.get("start_backend"))
+            if payload.get("tray_start_backend") or payload.get("start_backend")
+            else None
+        ),
     )
 
 
