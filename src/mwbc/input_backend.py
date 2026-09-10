@@ -146,6 +146,16 @@ class NullBackend:
         return None
 
 
+def _windows_virtual_screen(user32: Any) -> tuple[int, int, int, int]:
+    origin_x = int(user32.GetSystemMetrics(76))
+    origin_y = int(user32.GetSystemMetrics(77))
+    width = int(user32.GetSystemMetrics(78))
+    height = int(user32.GetSystemMetrics(79))
+    if width > 0 and height > 0:
+        return (origin_x, origin_y, width, height)
+    return (0, 0, int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1)))
+
+
 class PynputBackend:
     name = "pynput"
 
@@ -166,6 +176,7 @@ class PynputBackend:
         self._click_lock = threading.RLock()
         self._coalesce_tap_clicks = sys.platform == "darwin"
         self._cursor_hidden = False
+        self._screen_origin = (0, 0)
 
     def screen_size(self) -> tuple[int, int]:
         if sys.platform.startswith("win"):
@@ -173,7 +184,9 @@ class PynputBackend:
                 import ctypes
 
                 user32 = ctypes.windll.user32
-                return (int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1)))
+                origin_x, origin_y, width, height = _windows_virtual_screen(user32)
+                self._screen_origin = (origin_x, origin_y)
+                return (width, height)
             except Exception:
                 pass
 
@@ -185,18 +198,20 @@ class PynputBackend:
             width = int(root.winfo_screenwidth())
             height = int(root.winfo_screenheight())
             root.destroy()
+            self._screen_origin = (0, 0)
             return (width, height)
         except Exception:
+            self._screen_origin = (0, 0)
             return (1920, 1080)
 
     def current_position(self) -> tuple[int, int]:
         x, y = self._mouse_controller.position
-        return (int(x), int(y))
+        return self._normalize_position(int(x), int(y))
 
     def move_to(self, x: int, y: int) -> None:
         self._flush_pending_tap_clicks()
         self._flush_pending_click_presses()
-        self._mouse_controller.position = (int(x), int(y))
+        self._mouse_controller.position = self._denormalize_position(int(x), int(y))
 
     def move_relative(self, dx: int, dy: int) -> None:
         self._flush_pending_tap_clicks()
@@ -277,13 +292,16 @@ class PynputBackend:
         self.stop_capture()
 
         def on_move(x: int, y: int) -> None:
-            callbacks.on_move(int(x), int(y))
+            local_x, local_y = self._normalize_position(int(x), int(y))
+            callbacks.on_move(local_x, local_y)
 
         def on_click(x: int, y: int, button: Any, pressed: bool) -> None:
-            callbacks.on_click(int(x), int(y), self._button_to_name(button), bool(pressed))
+            local_x, local_y = self._normalize_position(int(x), int(y))
+            callbacks.on_click(local_x, local_y, self._button_to_name(button), bool(pressed))
 
         def on_scroll(x: int, y: int, dx: int, dy: int) -> None:
-            callbacks.on_scroll(int(x), int(y), int(dx), int(dy))
+            local_x, local_y = self._normalize_position(int(x), int(y))
+            callbacks.on_scroll(local_x, local_y, int(dx), int(dy))
 
         def on_press(key: Any) -> None:
             wire = self._key_to_wire(key)
@@ -326,6 +344,14 @@ class PynputBackend:
         if "." in name:
             return name.rsplit(".", 1)[-1]
         return name
+
+    def _normalize_position(self, x: int, y: int) -> tuple[int, int]:
+        origin_x, origin_y = getattr(self, "_screen_origin", (0, 0))
+        return (int(x) - int(origin_x), int(y) - int(origin_y))
+
+    def _denormalize_position(self, x: int, y: int) -> tuple[int, int]:
+        origin_x, origin_y = getattr(self, "_screen_origin", (0, 0))
+        return (int(x) + int(origin_x), int(y) + int(origin_y))
 
     def _button_from_name(self, name: str) -> Any:
         return getattr(self._mouse_module.Button, name, self._mouse_module.Button.left)

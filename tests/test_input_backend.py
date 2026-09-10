@@ -4,7 +4,7 @@ import threading
 import unittest
 from types import SimpleNamespace
 
-from mwbc.input_backend import PynputBackend
+from mwbc.input_backend import PynputBackend, _windows_virtual_screen
 
 
 class FakeKey:
@@ -77,6 +77,14 @@ class FakeMouseController:
         self.events.append(("scroll", (dx, dy)))
 
 
+class FakeUser32:
+    def __init__(self, values: dict[int, int]) -> None:
+        self.values = values
+
+    def GetSystemMetrics(self, index: int) -> int:  # noqa: N802
+        return self.values[index]
+
+
 class FakeTimer:
     def __init__(self) -> None:
         self.started = False
@@ -109,6 +117,7 @@ def make_mouse_backend(*, coalesce: bool = False) -> tuple[PynputBackend, FakeMo
     backend._pending_tap_clicks = {}
     backend._click_lock = threading.RLock()
     backend._coalesce_tap_clicks = coalesce
+    backend._screen_origin = (0, 0)
     backend._fake_timers = []
 
     def schedule_tap_click_flush(button_name: str) -> FakeTimer:
@@ -122,6 +131,43 @@ def make_mouse_backend(*, coalesce: bool = False) -> tuple[PynputBackend, FakeMo
 
 
 class InputBackendTests(unittest.TestCase):
+    def test_windows_virtual_screen_uses_full_desktop_area(self) -> None:
+        user32 = FakeUser32(
+            {
+                0: 2560,
+                1: 1440,
+                76: 0,
+                77: 0,
+                78: 5120,
+                79: 1440,
+            }
+        )
+
+        self.assertEqual(_windows_virtual_screen(user32), (0, 0, 5120, 1440))
+
+    def test_windows_virtual_screen_falls_back_to_primary_size(self) -> None:
+        user32 = FakeUser32(
+            {
+                0: 2560,
+                1: 1440,
+                76: 0,
+                77: 0,
+                78: 0,
+                79: 0,
+            }
+        )
+
+        self.assertEqual(_windows_virtual_screen(user32), (0, 0, 2560, 1440))
+
+    def test_mouse_position_is_normalized_against_virtual_screen_origin(self) -> None:
+        backend, controller = make_mouse_backend()
+        backend._screen_origin = (-1920, -120)
+        controller._position = (-1910, 30)
+
+        self.assertEqual(backend.current_position(), (10, 150))
+        backend.move_to(20, 160)
+        self.assertEqual(controller.events[-1], ("move_to", (-1900, 40)))
+
     def test_shifted_number_symbols_are_sent_as_base_keys_when_shift_is_down(self) -> None:
         backend = object.__new__(PynputBackend)
         backend._shift_down = True
