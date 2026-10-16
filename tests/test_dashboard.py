@@ -10,6 +10,11 @@ from mwbc.input_backend import NullBackend, apply_input_event
 
 
 class DashboardTests(unittest.TestCase):
+    def test_plain_http_dashboard_cannot_bind_to_lan(self) -> None:
+        server = DashboardServer("0.0.0.0", 0, lambda: {})
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            server.start()
+
     def test_web_input_requires_token(self) -> None:
         backend = NullBackend()
         server = self._server(backend)
@@ -96,6 +101,14 @@ class DashboardTests(unittest.TestCase):
             response = self._get(server, "/api/service", token="secret")
             self.assertTrue(response["ok"])
             self.assertTrue(response["payload"]["_authenticated"])
+        finally:
+            server.stop()
+
+    def test_query_cannot_spoof_management_authentication(self) -> None:
+        server = self._management_server()
+        try:
+            response = self._get(server, "/api/service?_authenticated=true")
+            self.assertFalse(response["payload"]["_authenticated"])
         finally:
             server.stop()
 

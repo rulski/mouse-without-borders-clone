@@ -6,7 +6,8 @@ It is an MVP, not a kernel-level input driver. Native input capture/injection is
 
 ## Features
 
-- Signed JSON-line protocol over TCP using a shared pairing secret.
+- Mutually authenticated TLS 1.2+ connections with explicitly approved device certificates.
+- Session-bound signed messages with strict ordered sequences to reject replay.
 - Always-looking client mode that reconnects to a host until it is available.
 - Agent mode for receiving mouse, keyboard, click, and scroll events.
 - Controller mode that switches to a peer when the pointer hits an edge.
@@ -51,6 +52,9 @@ mwbc init --name DESKTOP
 
 Copy the printed `pairing_secret` so both machines use the same value in `~/.mwbc/config.json`.
 
+Before starting either machine, complete **Secure Pairing** below. Existing
+plaintext clients are intentionally incompatible with protocol version 2.
+
 On the host machine whose mouse and keyboard you want to use, add each client by name and edge. The name must match the client's `machine_name` in its config. Always-looking clients must be listed on the host before they are allowed to connect.
 
 ```bash
@@ -80,6 +84,71 @@ When a connected host or client copies text or a supported clipboard image, MWBC
 Images are sent as PNG payloads and capped by `clipboard_max_image_bytes` in `~/.mwbc/config.json`. The default cap is 8 MB.
 
 Press `F12` on the host to toggle host lock. When host lock is on, edge switching is paused so the mouse and keyboard stay on the host. If you press `F12` while controlling a client, MWBC returns control to the host immediately. Press `F12` again to resume edge switching.
+
+## Secure Pairing
+
+Upgrade the package on both devices (`pip install -e ".[input,tray]"` in each
+checkout). Keep native Windows/macOS processes in their desktop OS sessions.
+Do not restart a working older installation until both sides are ready.
+
+Create a unique identity once on each machine:
+
+```bash
+mwbc security init
+mwbc security export
+mwbc security export --output device-public.json
+```
+
+The export contains the public certificate, machine name, device ID, and SHA-256
+fingerprint only. Transfer the host's public file to the client and the client's
+public file to the host. Verify each fingerprint independently against the
+originating machine's `security export` display before approving it. Trusting
+a fingerprint supplied only with an unverified downloaded file is not verification.
+Never transfer `private-key.pem`, the full config, or the management token.
+
+On the host, approve the client certificate for the `client` role, and configure
+its name as an edge peer as in Quick Start:
+
+```bash
+mwbc security trust --file client-public.json --fingerprint VERIFIED_CLIENT_SHA256 --role client
+```
+
+On the client, approve the host certificate for the `controller` role:
+
+```bash
+mwbc security trust --file host-public.json --fingerprint VERIFIED_HOST_SHA256 --role controller
+```
+
+For direct agent mode, the controller approves the target with `--role agent`;
+the target approves the controller with `--role controller`. Roles are assigned
+locally during approval, never trusted from a remote claim. Host mode does not
+accept incoming input controllers, and a direct agent accepts only one native
+controller connection at a time. Certificates, claimed device IDs, and names
+must match the approved identity. Renames and identity changes require deliberate
+re-pairing. The shared pairing secret remains an additional message credential;
+possessing it alone cannot authorize a device or role.
+
+Restart both sides after pairing. There is no plaintext fallback or automatic
+trust-on-first-use. Missing identities fail startup with setup guidance. A fresh
+server challenge binds every connection's signatures; sequence gaps, duplicates,
+and frames from prior connections are rejected before input is applied.
+
+Certificates expire after one year. To revoke a lost or changed remote identity:
+
+```bash
+mwbc security revoke --device-id REMOTE_DEVICE_ID
+```
+
+Restart MWBC immediately after revocation to close sessions and reload the TLS
+trust store. To replace an expired identity, stop the device, preserve its old
+certificate and key by moving them to a private backup (not leaving files at
+their original paths), clear its `tls_certificate` and `tls_private_key` config fields,
+then initialize a new certificate and explicitly revoke/re-approve it on peers.
+Do not clone a device's private identity onto a different machine.
+
+The `allow_insecure_loopback` setting exists only for isolated tests. It defaults
+to false, cannot bind/connect beyond numeric loopback addresses, and does not
+restore compatibility with the old session protocol. Leave it disabled on devices.
 
 ## Tray/Menu Bar Companion
 
@@ -122,7 +191,7 @@ Smith Command Center should treat MWBC as a separate local daemon and talk to th
 
 ```text
 MWBC_API_URL=http://127.0.0.1:45446
-MWBC_API_TOKEN=<pairing secret or token from the printed URL>
+MWBC_API_TOKEN=<management token from the host's printed URL or api_token config field>
 ```
 
 Unauthenticated read endpoints:
@@ -138,7 +207,10 @@ GET /api/v1/service
 
 The public service response intentionally omits secret-bearing controller and layout URLs. Send `X-MWBC-Token` with `GET /api/service` or `GET /api/v1/service` when Smith needs those private URLs.
 
-Authenticated endpoints require the pairing secret in `X-MWBC-Token`:
+Authenticated endpoints require the separate `api_token` in `X-MWBC-Token`.
+Peer pairing secrets no longer authorize dashboard, browser input, or service
+controls. Older configs receive a new independent management token on load;
+update Smith's `MWBC_API_TOKEN` after upgrading.
 
 ```text
 POST /api/layout
@@ -160,7 +232,9 @@ curl -H "X-MWBC-Token: paste-secret-here" http://127.0.0.1:45446/api/logs
 
 `POST /api/service/restart` and `POST /api/service/start` can accept a JSON body with `mode`, `backend`, `dashboard_host`, `dashboard_port`, and, for client mode, `host`, `port`, and `retry_seconds`. These endpoints are available only while the dashboard API is already running. If MWBC is stopped, Smith Command Center should launch the MWBC executable/process directly and then reconnect to the API.
 
-`POST /api/secret/regenerate` returns the new `pairing_secret` and updates the live dashboard token list. Smith should save the returned token immediately because future authenticated API calls need the new value.
+`POST /api/secret/regenerate` rotates the peer `pairing_secret`, not the management
+token. Update peer configurations before reconnecting; Smith's management token
+remains unchanged. Certificate trust is separate from both secrets.
 
 ## Direct Agent Mode
 
@@ -186,23 +260,26 @@ Use this when the device with the physical mouse and keyboard cannot run local s
 On the target machine:
 
 ```bash
-mwbc run --dashboard-host 0.0.0.0
+mwbc run --dashboard-host 127.0.0.1
 ```
 
 The terminal prints a URL like:
 
 ```text
-Web controller: http://192.168.1.50:45446/controller#token=...
+Web controller: http://127.0.0.1:45446/controller#token=...
 ```
 
-Open that URL from the locked-down device's browser. Press `Start` on the page to enter pointer lock. Mouse movement, clicks, wheel events, and common keyboard events will be sent to the target machine.
+For another device, publish this loopback service through a properly configured
+HTTPS reverse proxy with trusted certificates and access controls, then open the
+HTTPS controller URL with the management token fragment. Direct LAN HTTP binding
+is rejected. Press `Start` to enter pointer lock. Browser input is a separate
+management-authorized path, not an approved native TLS peer.
 
 Notes:
 
-- The URL fragment after `#token=` is the pairing secret. Treat it like a password.
+- The URL fragment after `#token=` is the management token. Treat it like a password.
 - Some browser or OS-reserved key combinations may not be capturable from a normal web page.
-- Open TCP port `45446` to the target machine if a local firewall blocks the dashboard.
-- For production use on an untrusted network, put the dashboard behind HTTPS and stronger session controls.
+- Do not expose port `45446` directly to the LAN. Only expose the HTTPS proxy.
 
 ## Startup/Login Install
 
@@ -305,7 +382,7 @@ mwbc add-peer --name WINDOWS2 --edge top
 mwbc host
 mwbc client --host 192.168.1.10
 mwbc run
-mwbc run --dashboard-host 0.0.0.0
+mwbc run --dashboard-host 127.0.0.1
 mwbc agent
 mwbc controller
 mwbc tray --smith-url http://localhost:3000/mwbc
@@ -327,7 +404,7 @@ mwbc run --backend null
 ## Notes
 
 - Open TCP port `45445` between machines.
-- Open TCP port `45446` when using browser controller mode from another device.
+- Use an HTTPS reverse proxy for remote browser controller access; port `45446` stays local.
 - Keep the dashboard bound to `127.0.0.1` unless you intentionally want it reachable from the LAN.
 - File drag/drop, auto-discovery, and per-monitor geometry are natural next additions.
 
@@ -346,15 +423,17 @@ until F12 resumes switching. Receivers release injected ordinary keys as well
 as modifiers and mouse buttons during reset. Update both host and client for
 the full recovery behavior.
 
-Security hardening remains pending: the TCP protocol is signed but not encrypted,
-and message nonces are not yet checked for replay. Use only on a trusted LAN.
-The next stages are verified encrypted pairing and role/replay enforcement,
-followed by unambiguous layout routing and clipboard responsiveness.
+Native connections now require mutual TLS and explicit device-role approval,
+with session-bound sequence enforcement. Layout routing and clipboard
+responsiveness remain the next stages. Native Windows/macOS two-device behavior
+must still be validated after upgrading and pairing both devices.
 
-The standard-library suite can run directly from this source checkout without
-installing native input hooks:
+The suite can run from this source checkout with the base package dependencies
+installed, without native input hooks. Security tests generate temporary identities
+and exercise actual TLS sockets:
 
 ```bash
+pip install -e .
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 

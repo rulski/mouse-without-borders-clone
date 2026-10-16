@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import html
+import ipaddress
 import json
 import threading
 import time
@@ -61,6 +62,12 @@ class DashboardServer:
         return f"http://{self.host}:{self.port}"
 
     def start(self) -> None:
+        try:
+            loopback = ipaddress.ip_address(self.host).is_loopback
+        except ValueError:
+            loopback = self.host == "localhost"
+        if not loopback:
+            raise ValueError("Dashboard HTTP must bind to localhost; use an authenticated HTTPS reverse proxy for LAN access")
         state_provider = self.state_provider
         auth_tokens = self.auth_tokens
         web_input_handler = self.web_input_handler

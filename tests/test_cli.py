@@ -95,7 +95,8 @@ class CliLayoutTests(unittest.TestCase):
 
                 self.assertNotEqual(result["pairing_secret"], "old-secret")
                 self.assertEqual(config.pairing_secret, result["pairing_secret"])
-                self.assertIn(result["pairing_secret"], auth_tokens)
+                self.assertNotIn(result["pairing_secret"], auth_tokens)
+                self.assertEqual(auth_tokens, [config.api_token])
                 self.assertNotIn("old-secret", auth_tokens)
                 self.assertEqual(load_config(config_path).pairing_secret, result["pairing_secret"])
             finally:
@@ -122,8 +123,9 @@ class CliLayoutTests(unittest.TestCase):
 
         payload = _service_status_payload(config, args, state, include_private=True)
 
-        self.assertIn("#token=secret", payload["layout_url"])
-        self.assertIn("#token=secret", payload["controller_url"])
+        self.assertIn("#token=" + config.api_token, payload["layout_url"])
+        self.assertIn("#token=" + config.api_token, payload["controller_url"])
+        self.assertNotIn("#token=secret", payload["layout_url"])
         self.assertTrue(payload["authenticated"])
 
     def test_load_config_migrates_missing_device_id(self) -> None:

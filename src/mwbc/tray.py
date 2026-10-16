@@ -163,7 +163,7 @@ class TrayApp:
         self.ImageDraw = image_draw_module
         self.api_url = normalize_base_url(args.api_url)
         self.smith_url = str(args.smith_url or DEFAULT_SMITH_URL)
-        self.token = str(args.token or config.pairing_secret)
+        self.token = str(args.token or config.api_token)
         self.poll_seconds = max(0.5, float(args.poll_seconds))
         self.start_mode = str(args.start_mode)
         self.start_backend = args.start_backend or config.backend

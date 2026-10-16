@@ -84,6 +84,11 @@ class AppConfig:
     machine_name: str = field(default_factory=socket.gethostname)
     device_id: str = field(default_factory=lambda: secrets.token_urlsafe(18))
     pairing_secret: str = field(default_factory=lambda: secrets.token_urlsafe(32))
+    api_token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
+    tls_certificate: str = ""
+    tls_private_key: str = ""
+    trusted_devices: list[dict[str, Any]] = field(default_factory=list)
+    allow_insecure_loopback: bool = False
     listen_host: str = "0.0.0.0"
     listen_port: int = DEFAULT_PORT
     dashboard_host: str = "127.0.0.1"
@@ -105,6 +110,11 @@ class AppConfig:
             machine_name=str(data.get("machine_name") or socket.gethostname()),
             device_id=str(data.get("device_id") or secrets.token_urlsafe(18)),
             pairing_secret=pairing_secret or secrets.token_urlsafe(32),
+            api_token=str(data.get("api_token") or secrets.token_urlsafe(32)),
+            tls_certificate=str(data.get("tls_certificate") or ""),
+            tls_private_key=str(data.get("tls_private_key") or ""),
+            trusted_devices=list(data.get("trusted_devices", [])),
+            allow_insecure_loopback=bool(data.get("allow_insecure_loopback", False)),
             listen_host=str(data.get("listen_host", "0.0.0.0")),
             listen_port=int(data.get("listen_port", DEFAULT_PORT)),
             dashboard_host=str(data.get("dashboard_host", "127.0.0.1")),
@@ -126,6 +136,11 @@ class AppConfig:
             "machine_name": self.machine_name,
             "device_id": self.device_id,
             "pairing_secret": self.pairing_secret,
+            "api_token": self.api_token,
+            "tls_certificate": self.tls_certificate,
+            "tls_private_key": self.tls_private_key,
+            "trusted_devices": self.trusted_devices,
+            "allow_insecure_loopback": self.allow_insecure_loopback,
             "listen_host": self.listen_host,
             "listen_port": self.listen_port,
             "dashboard_host": self.dashboard_host,
@@ -154,9 +169,8 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
     with target.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     config = AppConfig.from_dict(data)
-    if "device_id" not in data:
-        with contextlib.suppress(OSError):
-            save_config(config, target)
+    if not data.get("device_id") or not data.get("api_token"):
+        save_config(config, target)
     return config
 
 
@@ -165,9 +179,11 @@ def save_config(config: AppConfig, path: Path = DEFAULT_CONFIG_PATH) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
     try:
-        temporary.write_text(json.dumps(config.to_dict(), indent=2) + "\n", encoding="utf-8")
-        with contextlib.suppress(OSError):
-            temporary.chmod(0o600)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(config.to_dict(), indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, target)
         with contextlib.suppress(OSError):
             target.chmod(0o600)

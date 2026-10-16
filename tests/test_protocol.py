@@ -7,6 +7,12 @@ from mwbc.protocol import AuthenticationError, decode_message, decode_with_any_s
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_sequence_cannot_be_modified_without_resigning(self) -> None:
+        envelope = json.loads(encode_message("heartbeat", {}, "secret", sequence=1))
+        envelope["sequence"] = 2
+        with self.assertRaises(AuthenticationError):
+            decode_message(json.dumps(envelope), "secret")
+
     def test_round_trip_signed_message(self) -> None:
         encoded = encode_message("input", {"action": "move", "x": 10, "y": 20}, "secret")
         message = decode_message(encoded, "secret")

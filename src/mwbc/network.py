@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import json
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from . import __version__
 from .clipboard import (
     Clipboard,
     ClipboardError,
@@ -17,7 +20,8 @@ from .clipboard import (
 )
 from .config import AppConfig, PeerConfig
 from .input_backend import InputBackend, apply_input_event, reset_backend_input
-from .protocol import AuthenticationError, Message, decode_message, decode_with_any_secret, encode_message
+from .protocol import AuthenticationError, Message, decode_message, decode_with_any_secret, encode_message, session_secret
+from .security import tls_context, verify_peer
 from .state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -82,7 +86,12 @@ async def send_message(
     *,
     timeout: float | None = None,
 ) -> None:
-    writer.write(encode_message(message_type, payload, secret))
+    challenge = getattr(writer, "_mwbc_challenge", None)
+    if challenge is None:
+        raise AuthenticationError("Session handshake required before sending messages")
+    sequence = getattr(writer, "_mwbc_sequence", 0) + 1
+    writer._mwbc_sequence = sequence
+    writer.write(encode_message(message_type, payload, session_secret(secret, challenge), sequence=sequence))
     if timeout is None:
         await writer.drain()
     else:
@@ -93,7 +102,34 @@ async def read_message(reader: asyncio.StreamReader, secret: str) -> Message:
     line = await reader.readline()
     if not line:
         raise ConnectionError("connection closed")
-    return decode_message(line, secret)
+    challenge = getattr(reader, "_mwbc_challenge", None)
+    if challenge is None:
+        raise AuthenticationError("Session handshake required before receiving messages")
+    message = decode_message(line, session_secret(secret, challenge))
+    _accept_sequence(reader, message)
+    return message
+
+
+def _accept_sequence(reader: asyncio.StreamReader, message: Message) -> None:
+    expected = getattr(reader, "_mwbc_sequence", 0) + 1
+    if message.sequence != expected:
+        raise AuthenticationError("Replayed, missing, or out-of-order frame sequence")
+    reader._mwbc_sequence = expected
+
+
+async def _client_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    line = await asyncio.wait_for(reader.readline(), timeout=CONNECT_TIMEOUT_SECONDS)
+    if len(line) > 256:
+        raise AuthenticationError("Invalid session challenge")
+    try:
+        payload = json.loads(line)
+        challenge = payload["challenge"]
+        if payload.get("protocol") != 2 or not isinstance(challenge, str) or len(challenge) != 64:
+            raise ValueError("unsupported protocol")
+        bytes.fromhex(challenge)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise AuthenticationError("Invalid session challenge; both devices must be updated") from exc
+    reader._mwbc_challenge = writer._mwbc_challenge = challenge
 
 
 @dataclass(slots=True)
@@ -153,6 +189,9 @@ class RemoteClient:
                 self.peer.host,
                 self.peer.port,
                 limit=_stream_frame_limit(self.config),
+                ssl=tls_context(self.config, server=False, host=self.peer.host),
+                ssl_handshake_timeout=None if self.config.allow_insecure_loopback else CONNECT_TIMEOUT_SECONDS,
+                ssl_shutdown_timeout=None if self.config.allow_insecure_loopback else 2.0,
             ),
             timeout=CONNECT_TIMEOUT_SECONDS,
         )
@@ -160,6 +199,8 @@ class RemoteClient:
         self.writer = writer
         width, height = self.backend.screen_size()
         try:
+            verify_peer(self.config, writer, role="agent", device_id=self.peer.device_id, name=self.peer.name)
+            await _client_session(reader, writer)
             await send_message(
                 writer,
                 "hello",
@@ -168,7 +209,7 @@ class RemoteClient:
                     "device_id": self.config.device_id,
                     "screen_width": width,
                     "screen_height": height,
-                    "client_version": "0.1.0",
+                    "client_version": __version__,
                     "capabilities": LOCAL_CAPABILITIES,
                 },
                 self._secret,
@@ -177,6 +218,8 @@ class RemoteClient:
             ack = await asyncio.wait_for(read_message(reader, self._secret), timeout=CONNECT_TIMEOUT_SECONDS)
             if ack.type != "hello_ack":
                 raise ConnectionError(f"expected hello_ack, got {ack.type!r}")
+            verify_peer(self.config, writer, role="agent", device_id=str(ack.payload.get("device_id", "")),
+                        name=str(ack.payload.get("machine_name", "")))
         except Exception:
             await self.close()
             raise
@@ -393,6 +436,7 @@ class AgentServer:
         self._clipboard_task: asyncio.Task[None] | None = None
         self._stale_task: asyncio.Task[None] | None = None
         self._clipboard_last_seen: str | None = None
+        self._controller_writer: asyncio.StreamWriter | None = None
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(
@@ -400,6 +444,9 @@ class AgentServer:
             self.config.listen_host,
             self.config.listen_port,
             limit=_stream_frame_limit(self.config),
+            ssl=tls_context(self.config, server=True, host=self.config.listen_host),
+            ssl_handshake_timeout=None if self.config.allow_insecure_loopback else CONNECT_TIMEOUT_SECONDS,
+            ssl_shutdown_timeout=None if self.config.allow_insecure_loopback else 2.0,
         )
         sockets = ", ".join(str(sock.getsockname()) for sock in (self._server.sockets or []))
         logger.info("agent listening on %s", sockets)
@@ -441,28 +488,48 @@ class AgentServer:
         self._server = None
         if self.host_registry is not None:
             await self.host_registry.close_all()
+        if self._controller_writer is not None:
+            self._controller_writer.close()
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peername = str(writer.get_extra_info("peername"))
         incoming_key = peername
         secret = ""
         role = ""
+        owns_control = False
         try:
-            hello_line = await reader.readline()
+            challenge = secrets.token_hex(32)
+            reader._mwbc_challenge = writer._mwbc_challenge = challenge
+            writer.write((json.dumps({"protocol": 2, "challenge": challenge}) + "\n").encode("ascii"))
+            await asyncio.wait_for(writer.drain(), timeout=DEFAULT_SEND_TIMEOUT_SECONDS)
+            hello_line = await asyncio.wait_for(reader.readline(), timeout=CONNECT_TIMEOUT_SECONDS)
             if not hello_line:
                 return
-            hello, secret = decode_with_any_secret(hello_line, self.config.accepted_secrets())
+            candidates = {session_secret(value, challenge): value for value in self.config.accepted_secrets()}
+            hello, authenticated_secret = decode_with_any_secret(hello_line, list(candidates))
+            secret = candidates[authenticated_secret]
+            _accept_sequence(reader, hello)
             if hello.type != "hello":
                 raise AuthenticationError("first frame must be hello")
 
             client_name = str(hello.payload.get("machine_name", peername))
             device_id = _optional_string(hello.payload.get("device_id"))
             role = str(hello.payload.get("role", "controller"))
+            if role not in {"client", "controller"}:
+                raise AuthenticationError("Unknown connection role")
+            verify_peer(self.config, writer, role=role, device_id=device_id or "", name=client_name)
             capabilities = hello.payload.get("capabilities")
             if not isinstance(capabilities, dict):
                 capabilities = {}
             if role == "client":
                 self._validate_hosted_client_identity(client_name, device_id, secret)
+            else:
+                if self.host_registry is not None:
+                    raise AuthenticationError("Host mode does not accept incoming input controllers")
+                if self._controller_writer is not None:
+                    raise AuthenticationError("Another controller already owns this input session")
+                self._controller_writer = writer
+                owns_control = True
             incoming_key = f"{client_name} {peername}"
             self.state.update_incoming(
                 incoming_key,
@@ -485,7 +552,7 @@ class AgentServer:
                     "machine_name": self.config.machine_name,
                     "screen_width": width,
                     "screen_height": height,
-                    "server_version": "0.1.0",
+                    "server_version": __version__,
                     "device_id": self.config.device_id,
                     "capabilities": LOCAL_CAPABILITIES,
                 },
@@ -522,7 +589,8 @@ class AgentServer:
             logger.exception("client %s failed", peername)
             self.state.set_error(str(exc))
         finally:
-            if role and role != "client":
+            if owns_control:
+                self._controller_writer = None
                 reset_backend_input(self.backend)
             self.state.remove_incoming(incoming_key)
             writer.close()
@@ -544,7 +612,7 @@ class AgentServer:
                 if message.type == "clipboard_ack":
                     self._handle_clipboard_ack(message, client.name)
                     continue
-                logger.debug("ignoring hosted client message type %s from %s", message.type, client.name)
+                raise AuthenticationError(f"Client role cannot send {message.type!r}")
         finally:
             if self.host_registry is not None:
                 await self.host_registry.unregister(client.name, client)
@@ -561,7 +629,7 @@ class AgentServer:
         elif message.type == "heartbeat":
             return
         else:
-            logger.warning("ignoring unknown message type %s", message.type)
+            raise AuthenticationError(f"Controller role cannot send {message.type!r}")
 
     async def _apply_clipboard_message(self, message: Message, source: str) -> None:
         if self.clipboard is None or not self.config.clipboard_enabled:
@@ -724,9 +792,9 @@ class AgentServer:
         peer = known.get(client_name)
         if peer is None:
             raise AuthenticationError(f"{client_name} is not configured as a peer")
-        if peer.shared_secret and peer.shared_secret != secret:
+        if self.config.secret_for_peer(peer) != secret:
             raise AuthenticationError(f"{client_name} used the wrong peer secret")
-        if peer.device_id and device_id and peer.device_id != device_id:
+        if peer.device_id and peer.device_id != device_id:
             raise AuthenticationError(f"{client_name} device id does not match the configured peer")
 
 
@@ -788,12 +856,17 @@ class ClientConnector:
                 self.host,
                 self.port,
                 limit=_stream_frame_limit(self.config),
+                ssl=tls_context(self.config, server=False, host=self.host),
+                ssl_handshake_timeout=None if self.config.allow_insecure_loopback else CONNECT_TIMEOUT_SECONDS,
+                ssl_shutdown_timeout=None if self.config.allow_insecure_loopback else 2.0,
             ),
             timeout=CONNECT_TIMEOUT_SECONDS,
         )
         secret = self.config.pairing_secret
         width, height = self.backend.screen_size()
         try:
+            verify_peer(self.config, writer, role="controller")
+            await _client_session(reader, writer)
             await send_message(
                 writer,
                 "hello",
@@ -803,7 +876,7 @@ class ClientConnector:
                     "device_id": self.config.device_id,
                     "screen_width": width,
                     "screen_height": height,
-                    "client_version": "0.1.0",
+                    "client_version": __version__,
                     "capabilities": LOCAL_CAPABILITIES,
                 },
                 secret,
@@ -812,6 +885,8 @@ class ClientConnector:
             ack = await asyncio.wait_for(read_message(reader, secret), timeout=CONNECT_TIMEOUT_SECONDS)
             if ack.type != "hello_ack":
                 raise ConnectionError(f"expected hello_ack, got {ack.type!r}")
+            verify_peer(self.config, writer, role="controller", device_id=str(ack.payload.get("device_id", "")),
+                        name=str(ack.payload.get("machine_name", "")))
         except Exception:
             writer.close()
             with contextlib.suppress(Exception):
@@ -984,7 +1059,7 @@ class ClientConnector:
         elif message.type == "heartbeat":
             return
         else:
-            logger.warning("ignoring unknown host message type %s", message.type)
+            raise AuthenticationError(f"Host role cannot send {message.type!r}")
 
     async def _send_clipboard_ack(
         self,

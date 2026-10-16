@@ -21,3 +21,7 @@ Thumbs.db
 .codex/
 .agents/
 research/
+
+# Generated private TLS material must never enter source control.
+private-key.pem
+*-private-key.pem

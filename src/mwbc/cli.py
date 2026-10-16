@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import os
 import logging
 import signal
@@ -47,6 +48,17 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--name", help="Machine name to advertise.")
 
     subparsers.add_parser("secret", help="Print a new pairing secret.")
+    security = subparsers.add_parser("security", help="Create and explicitly approve TLS device identities.")
+    security_commands = security.add_subparsers(dest="security_command", required=True)
+    security_commands.add_parser("init", help="Create this machine's TLS identity.")
+    export = security_commands.add_parser("export", help="Export the public identity bundle (no private keys).")
+    export.add_argument("--output", type=Path, help="Write UTF-8 JSON without shell redirection.")
+    trust = security_commands.add_parser("trust", help="Approve a public identity after checking its fingerprint.")
+    trust.add_argument("--file", type=Path, required=True)
+    trust.add_argument("--fingerprint", required=True)
+    trust.add_argument("--role", choices=["client", "controller", "agent"], action="append", required=True)
+    revoke = security_commands.add_parser("revoke", help="Remove a previously approved device.")
+    revoke.add_argument("--device-id", required=True)
 
     peer = subparsers.add_parser("add-peer", help="Add or replace a configured peer.")
     peer.add_argument("--name", required=True)
@@ -82,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     tray = subparsers.add_parser("tray", help="Run the system tray/menu bar companion.")
     tray.add_argument("--api-url", default="http://127.0.0.1:45446", help="Local MWBC dashboard API URL.")
     tray.add_argument("--smith-url", default="http://localhost:3000/mwbc", help="Smith MWBC module URL.")
-    tray.add_argument("--token", help="Dashboard API token. Defaults to the configured pairing secret.")
+    tray.add_argument("--token", help="Dashboard API token. Defaults to the separate configured management token.")
     tray.add_argument("--poll-seconds", type=float, default=2.0, help="How often to refresh tray status.")
     tray.add_argument("--start-mode", choices=["host", "run"], default="host", help="Mode used by Start Host.")
     tray.add_argument("--start-backend", choices=["auto", "pynput", "null"], help="Backend used by Start Host.")
@@ -123,6 +135,31 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "init":
         return cmd_init(args)
+    if args.command == "security":
+        from .security import identity_bundle, initialize_identity, trust_identity
+
+        config = load_config(args.config)
+        if args.security_command == "init":
+            initialize_identity(config, args.config)
+            print("TLS identity created. Export and approve public identities on both devices.")
+        elif args.security_command == "export":
+            bundle = json.dumps(identity_bundle(config), indent=2)
+            if args.output:
+                with args.output.open("x", encoding="utf-8") as handle:
+                    handle.write(bundle + "\n")
+                print("Public identity exported. Check its fingerprint on the originating device before approval.")
+            else:
+                print(bundle)
+        elif args.security_command == "trust":
+            trust_identity(config, json.loads(args.file.read_text(encoding="utf-8-sig")),
+                           args.fingerprint, args.role)
+            save_config(config, args.config)
+            print("Device approved. Restart MWBC to apply the updated trust list.")
+        elif args.security_command == "revoke":
+            config.trusted_devices = [item for item in config.trusted_devices if item["device_id"] != args.device_id]
+            save_config(config, args.config)
+            print("Device revoked. Restart MWBC to close existing sessions and reload trust.")
+        return 0
     if args.command == "secret":
         print(generate_secret())
         return 0
@@ -380,7 +417,7 @@ def _build_management_handler(
         if action == "secret.regenerate":
             config.pairing_secret = generate_secret()
             save_config(config, config_path)
-            auth_tokens[:] = config.accepted_secrets()
+            auth_tokens[:] = [config.api_token]
             return {
                 "pairing_secret": config.pairing_secret,
                 "dashboard_url": _dashboard_url(config),
@@ -418,6 +455,13 @@ def _capabilities_payload() -> dict[str, Any]:
         },
         "logs": True,
         "api_version": 1,
+        "security": {
+            "transport": "mutual_tls",
+            "protocol_version": 2,
+            "explicit_pairing": True,
+            "session_sequence_replay_protection": True,
+            "separate_management_token": True,
+        },
     }
 
 
@@ -542,6 +586,16 @@ async def cmd_run(args: argparse.Namespace) -> int:
         config.dashboard_host = args.dashboard_host
     if getattr(args, "dashboard_port", None):
         config.dashboard_port = args.dashboard_port
+    from .security import tls_context
+
+    if args.command in {"run", "agent", "host"}:
+        tls_context(config, server=True, host=config.listen_host)
+    if args.command == "client":
+        tls_context(config, server=False, host=args.host)
+    if args.command in {"run", "controller", "host"}:
+        for peer in config.peers:
+            if peer.host:
+                tls_context(config, server=False, host=peer.host)
     backend = create_backend(config.backend)
     clipboard = create_clipboard() if config.clipboard_enabled else None
     state = StateStore(machine_name=config.machine_name, backend_name=backend.name, device_id=config.device_id)
@@ -561,7 +615,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         host_registry = HostClientRegistry(state)
 
     if args.command in {"run", "host"} and not args.no_dashboard:
-        auth_tokens = config.accepted_secrets()
+        auth_tokens = [config.api_token]
         dashboard = DashboardServer(
             config.dashboard_host,
             config.dashboard_port,
@@ -594,6 +648,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         print(f"Web controller: {_controller_url(config)}")
         print(f"Layout editor: {_layout_url(config)}")
         print(f"Pairing secret: {config.pairing_secret}")
+        print(f"Management token: {config.api_token}")
 
     agent: AgentServer | None = None
     controller: BorderController | None = None
@@ -679,7 +734,7 @@ def _controller_url(config: AppConfig) -> str:
     host = config.dashboard_host
     if host in {"0.0.0.0", "::"}:
         host = _guess_lan_ip()
-    return f"http://{host}:{config.dashboard_port}/controller#token={config.pairing_secret}"
+    return f"http://{host}:{config.dashboard_port}/controller#token={config.api_token}"
 
 
 def _dashboard_url(config: AppConfig) -> str:
@@ -693,7 +748,7 @@ def _layout_url(config: AppConfig) -> str:
     host = config.dashboard_host
     if host in {"0.0.0.0", "::"}:
         host = _guess_lan_ip()
-    return f"http://{host}:{config.dashboard_port}/layout#token={config.pairing_secret}"
+    return f"http://{host}:{config.dashboard_port}/layout#token={config.api_token}"
 
 
 def _guess_lan_ip() -> str:

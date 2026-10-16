@@ -4,10 +4,16 @@ import asyncio
 import unittest
 
 from mwbc.clipboard import NullClipboard
-from mwbc.config import AppConfig, PeerConfig
+from mwbc.config import AppConfig as ProductionConfig, PeerConfig
 from mwbc.input_backend import NullBackend
 from mwbc.network import AgentServer, ClientConnector, HEARTBEAT_STALE_SECONDS, HostClientRegistry
 from mwbc.state import StateStore
+
+
+def AppConfig(**values):
+    # These behavioral tests use a deliberately explicit loopback-only transport.
+    # Mutual TLS and identity authorization are exercised in test_security.py.
+    return ProductionConfig(allow_insecure_loopback=True, **values)
 
 
 class RejectingImageClipboard(NullClipboard):
