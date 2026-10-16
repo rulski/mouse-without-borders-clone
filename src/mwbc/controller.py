@@ -19,6 +19,7 @@ LOCK_MOTION_DROP_SECONDS = 0.2
 MAX_LOCK_DELTA_RATIO = 0.25
 RETURN_CONFIRM_DELAY_SECONDS = 0.03
 LOCK_PARK_RUNWAY_PX = 1
+INPUT_QUEUE_MAXSIZE = 2048
 REMOTE_MODIFIER_RESET_KEYS = (
     "shift",
     "shift_l",
@@ -33,6 +34,7 @@ REMOTE_MODIFIER_RESET_KEYS = (
     "cmd_l",
     "cmd_r",
 )
+REMOTE_MOUSE_RESET_BUTTONS = ("left", "middle", "right")
 
 
 @dataclass(slots=True)
@@ -56,7 +58,7 @@ class BorderController:
         self.state = state
         self.host_registry = host_registry
         self.loop: asyncio.AbstractEventLoop | None = None
-        self.queue: asyncio.Queue[tuple[str, tuple[Any, ...]]] = asyncio.Queue()
+        self.queue: asyncio.Queue[tuple[str, tuple[Any, ...]]] = asyncio.Queue(maxsize=INPUT_QUEUE_MAXSIZE)
         self.clients: dict[str, RemoteClient] = {
             peer.name: RemoteClient(config=config, peer=peer, backend=backend, state=state)
             for peer in config.peers if peer.host
@@ -70,10 +72,11 @@ class BorderController:
         self._active_watch_task: asyncio.Task[None] | None = None
         self._ignore_next_lock_motion = False
         self._ignore_lock_motion_until = 0.0
+        self._host_lock_pressed = False
         self.edge_switching_paused = False
 
         for peer in config.peers:
-            state.register_peer(peer.name, peer.host, peer.port, peer.edge)
+            state.register_peer(peer.name, peer.host, peer.port, peer.edge, peer.device_id)
         state.update(
             local_screen_width=self.local_size.width,
             local_screen_height=self.local_size.height,
@@ -89,6 +92,7 @@ class BorderController:
         self._active_watch_task = asyncio.create_task(self._active_watch_loop(), name="mwbc-active-watch")
 
     async def stop(self) -> None:
+        await self._return_local("controller stopping", mark_disconnected=False)
         self._set_local_cursor_visible(True)
         self.backend.stop_capture()
         for task in (self._event_task, self._reconnect_task, self._active_watch_task):
@@ -107,7 +111,7 @@ class BorderController:
                 await client.close()
 
         for peer in self.config.peers:
-            self.state.register_peer(peer.name, peer.host, peer.port, peer.edge)
+            self.state.register_peer(peer.name, peer.host, peer.port, peer.edge, peer.device_id)
             if not peer.host:
                 continue
             client = self.clients.get(peer.name)
@@ -130,7 +134,41 @@ class BorderController:
     def _enqueue(self, event_type: str, *values: Any) -> None:
         if self.loop is None:
             return
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, (event_type, values))
+        self.loop.call_soon_threadsafe(self._enqueue_nowait, event_type, values)
+
+    def _enqueue_nowait(self, event_type: str, values: tuple[Any, ...]) -> None:
+        if self.queue.full():
+            if event_type == "move":
+                self._drop_queued_motion_events()
+            else:
+                self._drop_oldest_event()
+        try:
+            self.queue.put_nowait((event_type, values))
+        except asyncio.QueueFull:
+            self.state.increment("events_dropped")
+
+    def _drop_oldest_event(self) -> None:
+        with contextlib.suppress(asyncio.QueueEmpty):
+            self.queue.get_nowait()
+            self.state.increment("events_dropped")
+
+    def _drop_queued_motion_events(self) -> None:
+        kept: list[tuple[str, tuple[Any, ...]]] = []
+        dropped = 0
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item[0] == "move":
+                dropped += 1
+            else:
+                kept.append(item)
+        for item in kept:
+            with contextlib.suppress(asyncio.QueueFull):
+                self.queue.put_nowait(item)
+        if dropped:
+            self.state.increment("events_dropped", dropped)
 
     async def _event_pump(self) -> None:
         while True:
@@ -188,11 +226,20 @@ class BorderController:
 
         self.active = None
         self.state.update(active_peer=None)
+        control_error: Exception | None = None
+        try:
+            await self._send_remote_inactive(active.client)
+        except Exception as exc:
+            control_error = exc
         if mark_disconnected:
-            self.state.update_peer(active.peer.name, connected=False, error=reason)
+            self.state.update_peer(active.peer.name, connected=False, health="offline", error=reason)
             self.state.set_error(f"{active.peer.name}: {reason}")
+        elif control_error is not None:
+            self.state.update_peer(active.peer.name, connected=False, health="offline", error=str(control_error))
+            self.state.set_error(f"{active.peer.name}: {control_error}")
         local_point = self._local_return_point(active)
         await self._restore_local_pointer(local_point)
+        self._drop_queued_motion_events()
         self._ignore_next_lock_motion = False
         self._ignore_lock_motion_until = 0.0
         self.state.update(
@@ -214,7 +261,11 @@ class BorderController:
         if not _is_host_lock_hotkey(key):
             return False
         if pressed:
-            await self._toggle_edge_switching_pause()
+            if not self._host_lock_pressed:
+                self._host_lock_pressed = True
+                await self._toggle_edge_switching_pause()
+        else:
+            self._host_lock_pressed = False
         return True
 
     async def _toggle_edge_switching_pause(self) -> None:
@@ -298,7 +349,7 @@ class BorderController:
             )
             self.state.update(active_peer=peer.name)
             await client.send("control", {"active": True})
-            await self._send_remote_modifier_reset(client)
+            await self._send_remote_input_reset(client)
             await client.send("input", {"action": "move", "x": remote_point.x, "y": remote_point.y})
             self.state.increment("events_forwarded")
             self._set_local_cursor_visible(False)
@@ -399,11 +450,11 @@ class BorderController:
         self.active = None
         control_error: Exception | None = None
         try:
-            await self._send_remote_modifier_reset(active.client)
-            await active.client.send("control", {"active": False})
+            await self._send_remote_inactive(active.client)
         except Exception as exc:
             control_error = exc
         await self._restore_local_pointer(local_point)
+        self._drop_queued_motion_events()
         self._ignore_next_lock_motion = False
         self._ignore_lock_motion_until = 0.0
         self.state.update(
@@ -425,7 +476,7 @@ class BorderController:
             local_point.y,
         )
         if control_error is not None:
-            self.state.update_peer(active.peer.name, connected=False, error=str(control_error))
+            self.state.update_peer(active.peer.name, connected=False, health="offline", error=str(control_error))
             self.state.set_error(f"{active.peer.name}: {control_error}")
 
     async def _handle_click(self, _x: int, _y: int, button: str, pressed: bool) -> None:
@@ -437,6 +488,15 @@ class BorderController:
     async def _send_remote_modifier_reset(self, client: object) -> None:
         for key in REMOTE_MODIFIER_RESET_KEYS:
             await client.send("input", {"action": "key_release", "key": {"kind": "special", "value": key}})
+
+    async def _send_remote_input_reset(self, client: object) -> None:
+        await self._send_remote_modifier_reset(client)
+        for button in REMOTE_MOUSE_RESET_BUTTONS:
+            await client.send("input", {"action": "click", "button": button, "pressed": False})
+
+    async def _send_remote_inactive(self, client: object) -> None:
+        await self._send_remote_input_reset(client)
+        await client.send("control", {"active": False})
 
     async def _handle_scroll(self, dx: int, dy: int) -> None:
         if self.active is None:

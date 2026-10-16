@@ -86,6 +86,25 @@ class DashboardTests(unittest.TestCase):
             response = self._get(server, "/api/service")
             self.assertTrue(response["ok"])
             self.assertEqual(response["action"], "service.status")
+            self.assertFalse(response["payload"]["_authenticated"])
+        finally:
+            server.stop()
+
+    def test_management_service_status_passes_auth_context(self) -> None:
+        server = self._management_server()
+        try:
+            response = self._get(server, "/api/service", token="secret")
+            self.assertTrue(response["ok"])
+            self.assertTrue(response["payload"]["_authenticated"])
+        finally:
+            server.stop()
+
+    def test_v1_status_wraps_state(self) -> None:
+        server = self._management_server()
+        try:
+            response = self._get(server, "/api/v1/status")
+            self.assertEqual(response["api_version"], 1)
+            self.assertEqual(response["state"]["machine_name"], "HOST")
         finally:
             server.stop()
 

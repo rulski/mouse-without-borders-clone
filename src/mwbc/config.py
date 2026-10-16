@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import secrets
 import socket
 from dataclasses import asdict, dataclass, field
@@ -28,6 +30,7 @@ def normalize_scroll_multiplier(value: Any) -> float:
 @dataclass(slots=True)
 class PeerConfig:
     name: str
+    device_id: str | None = None
     host: str = ""
     edge: str = "right"
     port: int = DEFAULT_PORT
@@ -49,6 +52,7 @@ class PeerConfig:
 
         return cls(
             name=name,
+            device_id=data.get("device_id") or None,
             host=host,
             edge=edge,
             port=int(data.get("port", DEFAULT_PORT)),
@@ -60,6 +64,8 @@ class PeerConfig:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        if self.device_id is None:
+            data.pop("device_id")
         if not self.host:
             data.pop("host")
         if self.shared_secret is None:
@@ -76,6 +82,7 @@ class PeerConfig:
 @dataclass(slots=True)
 class AppConfig:
     machine_name: str = field(default_factory=socket.gethostname)
+    device_id: str = field(default_factory=lambda: secrets.token_urlsafe(18))
     pairing_secret: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     listen_host: str = "0.0.0.0"
     listen_port: int = DEFAULT_PORT
@@ -96,6 +103,7 @@ class AppConfig:
         pairing_secret = str(data.get("pairing_secret") or "").strip()
         return cls(
             machine_name=str(data.get("machine_name") or socket.gethostname()),
+            device_id=str(data.get("device_id") or secrets.token_urlsafe(18)),
             pairing_secret=pairing_secret or secrets.token_urlsafe(32),
             listen_host=str(data.get("listen_host", "0.0.0.0")),
             listen_port=int(data.get("listen_port", DEFAULT_PORT)),
@@ -116,6 +124,7 @@ class AppConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "machine_name": self.machine_name,
+            "device_id": self.device_id,
             "pairing_secret": self.pairing_secret,
             "listen_host": self.listen_host,
             "listen_port": self.listen_port,
@@ -141,14 +150,30 @@ class AppConfig:
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
-    with path.expanduser().open("r", encoding="utf-8") as handle:
-        return AppConfig.from_dict(json.load(handle))
+    target = path.expanduser()
+    with target.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    config = AppConfig.from_dict(data)
+    if "device_id" not in data:
+        with contextlib.suppress(OSError):
+            save_config(config, target)
+    return config
 
 
 def save_config(config: AppConfig, path: Path = DEFAULT_CONFIG_PATH) -> None:
     target = path.expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(config.to_dict(), indent=2) + "\n", encoding="utf-8")
+    temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        temporary.write_text(json.dumps(config.to_dict(), indent=2) + "\n", encoding="utf-8")
+        with contextlib.suppress(OSError):
+            temporary.chmod(0o600)
+        os.replace(temporary, target)
+        with contextlib.suppress(OSError):
+            target.chmod(0o600)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
 
 
 def ensure_config(path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:

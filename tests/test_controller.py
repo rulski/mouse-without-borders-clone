@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 from mwbc.config import AppConfig, PeerConfig
-from mwbc.controller import REMOTE_MODIFIER_RESET_KEYS, ActiveRemote, BorderController
+from mwbc.controller import REMOTE_MODIFIER_RESET_KEYS, REMOTE_MOUSE_RESET_BUTTONS, ActiveRemote, BorderController
 from mwbc.geometry import Point
 from mwbc.input_backend import NullBackend
 from mwbc.state import StateStore
@@ -152,6 +152,29 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(peer_state["connected"])
         self.assertIsNone(peer_state["error"])
         self.assertEqual(backend.capture_modes[-2:], [True, False])
+        self.assertEqual(client.sent[-1], ("control", {"active": False}))
+        self.assertEqual(
+            client.sent[-4:-1],
+            [
+                ("input", {"action": "click", "button": button, "pressed": False})
+                for button in REMOTE_MOUSE_RESET_BUTTONS
+            ],
+        )
+
+    async def test_host_lock_hotkey_debounces_until_release(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        config = AppConfig(machine_name="host", peers=[peer])
+        backend = TrackingBackend()
+        state = StateStore("host", backend.name)
+        controller = BorderController(config, backend, state)
+
+        await controller._handle_host_lock_hotkey({"kind": "special", "value": "f12"}, pressed=True)
+        await controller._handle_host_lock_hotkey({"kind": "special", "value": "f12"}, pressed=True)
+        self.assertTrue(controller.edge_switching_paused)
+
+        await controller._handle_host_lock_hotkey({"kind": "special", "value": "f12"}, pressed=False)
+        await controller._handle_host_lock_hotkey({"kind": "special", "value": "f12"}, pressed=True)
+        self.assertFalse(controller.edge_switching_paused)
 
     async def test_left_edge_activation_ignores_stale_pre_lock_motion(self) -> None:
         peer = PeerConfig(name="mac", edge="left")
@@ -177,6 +200,14 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                 for key in REMOTE_MODIFIER_RESET_KEYS
             ],
         )
+        mouse_reset_start = 1 + len(REMOTE_MODIFIER_RESET_KEYS)
+        self.assertEqual(
+            client.sent[mouse_reset_start : mouse_reset_start + len(REMOTE_MOUSE_RESET_BUTTONS)],
+            [
+                ("input", {"action": "click", "button": button, "pressed": False})
+                for button in REMOTE_MOUSE_RESET_BUTTONS
+            ],
+        )
         self.assertEqual(client.sent[-1], ("input", {"action": "move", "x": 1678, "y": 486}))
         self.assertEqual(
             backend.actions[-3:],
@@ -185,7 +216,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state.snapshot()["local_cursor_visible"])
 
         await controller._handle_move(0, 500)
-        self.assertEqual(len(client.sent), 2 + len(REMOTE_MODIFIER_RESET_KEYS))
+        self.assertEqual(len(client.sent), 2 + len(REMOTE_MODIFIER_RESET_KEYS) + len(REMOTE_MOUSE_RESET_BUTTONS))
 
         await controller._handle_move(controller.lock_point.x, controller.lock_point.y)
         await controller._handle_move(controller.lock_point.x - 5, controller.lock_point.y)
@@ -209,7 +240,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         controller._ignore_lock_motion_until = 0.0
         await controller._handle_move(0, 500)
 
-        self.assertEqual(len(client.sent), 2 + len(REMOTE_MODIFIER_RESET_KEYS))
+        self.assertEqual(len(client.sent), 2 + len(REMOTE_MODIFIER_RESET_KEYS) + len(REMOTE_MOUSE_RESET_BUTTONS))
         self.assertEqual(controller.active.point, Point(1678, 486))
         self.assertEqual(backend.current_position(), (controller.lock_point.x, controller.lock_point.y))
 

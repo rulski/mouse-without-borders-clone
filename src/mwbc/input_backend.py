@@ -87,6 +87,9 @@ class InputBackend(Protocol):
     def reset_modifiers(self) -> None:
         ...
 
+    def reset_input(self) -> None:
+        ...
+
     def set_cursor_visible(self, visible: bool) -> None:
         ...
 
@@ -135,6 +138,10 @@ class NullBackend:
     def reset_modifiers(self) -> None:
         logger.info("null reset_modifiers()")
 
+    def reset_input(self) -> None:
+        logger.info("null reset_input()")
+        self.reset_modifiers()
+
     def set_cursor_visible(self, visible: bool) -> None:
         self._cursor_visible = bool(visible)
         logger.info("null set_cursor_visible(%s)", visible)
@@ -173,6 +180,7 @@ class PynputBackend:
         self._replay_one_shot_chars: set[str] = set()
         self._pending_click_presses: dict[str, Any] = {}
         self._pending_tap_clicks: dict[str, PendingTapClick] = {}
+        self._pressed_buttons: set[Any] = set()
         self._click_lock = threading.RLock()
         self._coalesce_tap_clicks = sys.platform == "darwin"
         self._cursor_hidden = False
@@ -223,8 +231,10 @@ class PynputBackend:
         if not self._coalesce_tap_clicks:
             if pressed:
                 self._mouse_controller.press(btn)
+                self._pressed_buttons.add(btn)
             else:
                 self._mouse_controller.release(btn)
+                self._pressed_buttons.discard(btn)
             return
 
         if pressed:
@@ -235,6 +245,7 @@ class PynputBackend:
                 self._queue_tap_click(button, pending)
             else:
                 self._mouse_controller.release(btn)
+                self._pressed_buttons.discard(btn)
 
     def scroll(self, dx: int, dy: int) -> None:
         self._flush_pending_tap_clicks()
@@ -279,6 +290,10 @@ class PynputBackend:
                 self._keyboard_controller.release(key)
             except Exception:
                 logger.debug("failed to release modifier %r", key, exc_info=True)
+
+    def reset_input(self) -> None:
+        self.reset_modifiers()
+        self._reset_mouse_buttons()
 
     def set_cursor_visible(self, visible: bool) -> None:
         if visible and self._cursor_hidden:
@@ -363,6 +378,7 @@ class PynputBackend:
         self._pending_click_presses.clear()
         for button in pending:
             self._mouse_controller.press(button)
+            self._pressed_buttons.add(button)
 
     def _queue_tap_click(self, button_name: str, button: Any) -> None:
         with self._click_lock:
@@ -395,6 +411,31 @@ class PynputBackend:
         for item in pending:
             item.timer.cancel()
             self._mouse_controller.click(item.button, 1)
+
+    def _reset_mouse_buttons(self) -> None:
+        with self._click_lock:
+            for item in self._pending_tap_clicks.values():
+                item.timer.cancel()
+            self._pending_tap_clicks.clear()
+            self._pending_click_presses.clear()
+
+        buttons = list(self._pressed_buttons)
+        for name in ("left", "middle", "right"):
+            button = getattr(self._mouse_module.Button, name, None)
+            if button is not None:
+                buttons.append(button)
+
+        seen: set[str] = set()
+        for button in buttons:
+            key = repr(button)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                self._mouse_controller.release(button)
+            except Exception:
+                logger.debug("failed to release mouse button %r", button, exc_info=True)
+        self._pressed_buttons.clear()
 
     def _key_to_wire(self, key: Any) -> dict[str, str]:
         char = getattr(key, "char", None)
@@ -518,6 +559,14 @@ def create_backend(kind: str) -> InputBackend:
         return NullBackend(reason=str(exc))
 
 
+def reset_backend_input(backend: InputBackend) -> None:
+    reset_input = getattr(backend, "reset_input", None)
+    if callable(reset_input):
+        reset_input()
+        return
+    backend.reset_modifiers()
+
+
 def apply_input_event(backend: InputBackend, event: dict[str, Any]) -> None:
     action = event.get("action")
     if action == "move":
@@ -534,5 +583,7 @@ def apply_input_event(backend: InputBackend, event: dict[str, Any]) -> None:
         backend.key_release(dict(event["key"]))
     elif action == "reset_modifiers":
         backend.reset_modifiers()
+    elif action == "reset_input":
+        reset_backend_input(backend)
     else:
         raise ValueError(f"unknown input action {action!r}")

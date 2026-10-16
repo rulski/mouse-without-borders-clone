@@ -278,7 +278,7 @@ def _build_layout_update_handler(
                     peer.scroll_multiplier = updates["scroll_multiplier"]
             save_config(config, config_path)
             for peer in config.peers:
-                state.register_peer(peer.name, peer.host, peer.port, peer.edge)
+                state.register_peer(peer.name, peer.host, peer.port, peer.edge, peer.device_id)
 
         controller = controller_ref.get("controller")
         if controller is not None and controller.loop is not None and controller.loop.is_running():
@@ -306,10 +306,14 @@ def _layout_snapshot(config: AppConfig, state: StateStore) -> dict[str, Any]:
         peers.append(
             {
                 "name": peer.name,
+                "device_id": peer.device_id or status.get("device_id"),
                 "host": peer.host,
                 "port": peer.port,
                 "edge": peer.edge,
                 "connected": bool(status.get("connected")),
+                "health": status.get("health"),
+                "last_seen": status.get("last_seen"),
+                "last_seen_age": status.get("last_seen_age"),
                 "screen_width": status.get("screen_width"),
                 "screen_height": status.get("screen_height"),
                 "error": status.get("error"),
@@ -318,7 +322,7 @@ def _layout_snapshot(config: AppConfig, state: StateStore) -> dict[str, Any]:
                 "scroll_multiplier": peer.scroll_multiplier,
             }
         )
-    return {"machine_name": config.machine_name, "peers": peers}
+    return {"api_version": 1, "machine_name": config.machine_name, "device_id": config.device_id, "peers": peers}
 
 
 async def _send_peer_settings(config: AppConfig, host_registry: HostClientRegistry, names: Any) -> None:
@@ -350,7 +354,7 @@ def _build_management_handler(
         if action == "capabilities":
             return _capabilities_payload()
         if action == "service.status":
-            return _service_status_payload(config, args, state)
+            return _service_status_payload(config, args, state, include_private=bool(payload.get("_authenticated")))
         if action == "service.stop":
             loop.call_soon_threadsafe(stop_event.set)
             return {"ok": True, "action": "stop", "message": "MWBC is stopping"}
@@ -413,24 +417,39 @@ def _capabilities_payload() -> dict[str, Any]:
             },
         },
         "logs": True,
+        "api_version": 1,
     }
 
 
-def _service_status_payload(config: AppConfig, args: argparse.Namespace, state: StateStore) -> dict[str, Any]:
+def _service_status_payload(
+    config: AppConfig,
+    args: argparse.Namespace,
+    state: StateStore,
+    *,
+    include_private: bool = False,
+) -> dict[str, Any]:
     snapshot = state.snapshot()
-    return {
+    payload = {
+        "api_version": 1,
         "running": True,
         "pid": os.getpid(),
         "mode": snapshot.get("mode") or args.command,
         "command": args.command,
         "config_path": str(args.config.expanduser()),
         "dashboard_url": _dashboard_url(config),
-        "layout_url": _layout_url(config) if args.command in {"run", "host"} else None,
-        "controller_url": _controller_url(config) if args.command in {"run", "host"} else None,
+        "layout_url": None,
+        "controller_url": None,
+        "private_endpoints_require_token": True,
+        "authenticated": include_private,
         "backend": snapshot.get("backend"),
         "machine_name": snapshot.get("machine_name"),
+        "device_id": snapshot.get("device_id"),
         "uptime_seconds": snapshot.get("uptime_seconds"),
     }
+    if include_private and args.command in {"run", "host"}:
+        payload["layout_url"] = _layout_url(config)
+        payload["controller_url"] = _controller_url(config)
+    return payload
 
 
 def _startup_status_payload(status) -> dict[str, Any]:
@@ -525,7 +544,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         config.dashboard_port = args.dashboard_port
     backend = create_backend(config.backend)
     clipboard = create_clipboard() if config.clipboard_enabled else None
-    state = StateStore(machine_name=config.machine_name, backend_name=backend.name)
+    state = StateStore(machine_name=config.machine_name, backend_name=backend.name, device_id=config.device_id)
     width, height = backend.screen_size()
     state.update(local_screen_width=width, local_screen_height=height)
     if getattr(backend, "reason", None):

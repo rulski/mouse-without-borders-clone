@@ -6,7 +6,7 @@ import unittest
 from mwbc.clipboard import NullClipboard
 from mwbc.config import AppConfig, PeerConfig
 from mwbc.input_backend import NullBackend
-from mwbc.network import AgentServer, ClientConnector, HostClientRegistry
+from mwbc.network import AgentServer, ClientConnector, HEARTBEAT_STALE_SECONDS, HostClientRegistry
 from mwbc.state import StateStore
 
 
@@ -465,6 +465,82 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             await self._wait_for_state(client_state, "keep_awake", True)
             await self._wait_for_state(client_state, "last_keep_awake_at")
             self.assertEqual(client_backend.current_position(), (960, 540))
+        finally:
+            await connector.stop()
+            await server.stop()
+
+    async def test_unknown_always_looking_client_is_rejected(self) -> None:
+        host_config = AppConfig(
+            machine_name="host",
+            pairing_secret="secret",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            peers=[PeerConfig(name="client", edge="right")],
+        )
+        host_backend = NullBackend()
+        host_state = StateStore("host", host_backend.name)
+        host_state.register_peer("client", "", 45445, "right")
+        registry = HostClientRegistry(host_state)
+        server = AgentServer(host_config, host_backend, host_state, host_registry=registry)
+        await server.start()
+        assert server._server is not None
+        port = server._server.sockets[0].getsockname()[1]
+
+        client_config = AppConfig(machine_name="other", pairing_secret="secret")
+        connector = ClientConnector(
+            config=client_config,
+            backend=NullBackend(),
+            state=StateStore("other", "null"),
+            host="127.0.0.1",
+            port=port,
+            retry_seconds=0.05,
+        )
+
+        try:
+            with self.assertRaises(ConnectionError):
+                await asyncio.wait_for(connector._connect_once(), timeout=1)
+            self.assertIsNone(await registry.get("other"))
+        finally:
+            await server.stop()
+
+    async def test_stale_hosted_client_is_pruned_from_registry(self) -> None:
+        host_config = AppConfig(
+            machine_name="host",
+            pairing_secret="secret",
+            listen_host="127.0.0.1",
+            listen_port=0,
+            peers=[PeerConfig(name="client", edge="right")],
+        )
+        host_backend = NullBackend()
+        host_state = StateStore("host", host_backend.name)
+        host_state.register_peer("client", "", 45445, "right")
+        registry = HostClientRegistry(host_state)
+        server = AgentServer(host_config, host_backend, host_state, host_registry=registry)
+        await server.start()
+        assert server._server is not None
+        port = server._server.sockets[0].getsockname()[1]
+
+        client_config = AppConfig(machine_name="client", pairing_secret="secret")
+        connector = ClientConnector(
+            config=client_config,
+            backend=NullBackend(),
+            state=StateStore("client", "null"),
+            host="127.0.0.1",
+            port=port,
+            retry_seconds=0.05,
+        )
+
+        try:
+            await connector.start()
+            hosted_client = await self._wait_for_hosted_client(registry, "client")
+            hosted_client.last_seen -= HEARTBEAT_STALE_SECONDS + 1
+            await registry.prune_stale()
+
+            self.assertIsNone(await registry.get("client"))
+            peer_state = host_state.snapshot()["peers"][0]
+            self.assertFalse(peer_state["connected"])
+            self.assertEqual(peer_state["health"], "stale")
+            self.assertIn("no heartbeat", peer_state["error"])
         finally:
             await connector.stop()
             await server.stop()

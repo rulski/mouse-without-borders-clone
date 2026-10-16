@@ -16,7 +16,7 @@ from .clipboard import (
     write_clipboard_payload,
 )
 from .config import AppConfig, PeerConfig
-from .input_backend import InputBackend, apply_input_event
+from .input_backend import InputBackend, apply_input_event, reset_backend_input
 from .protocol import AuthenticationError, Message, decode_message, decode_with_any_secret, encode_message
 from .state import StateStore
 
@@ -26,9 +26,15 @@ MessageHandler = Callable[[Message, str], Awaitable[None]]
 CONNECT_TIMEOUT_SECONDS = 10.0
 HEARTBEAT_INTERVAL_SECONDS = 3.0
 HEARTBEAT_SEND_TIMEOUT_SECONDS = 5.0
+HEARTBEAT_STALE_SECONDS = 12.0
+DEFAULT_SEND_TIMEOUT_SECONDS = 2.0
+CLIPBOARD_SEND_TIMEOUT_SECONDS = 30.0
 MIN_STREAM_FRAME_LIMIT_BYTES = 1_048_576
 STREAM_FRAME_OVERHEAD_BYTES = 262_144
 LOCAL_CAPABILITIES: dict[str, Any] = {
+    "input": {
+        "reset_input": True,
+    },
     "clipboard": {
         "text": True,
         "image": True,
@@ -103,6 +109,17 @@ def _screen_from_payload(payload: dict[str, Any]) -> RemoteScreen:
     )
 
 
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _stale_error(client: "HostedRemoteClient") -> str:
+    return f"no heartbeat from {client.name} for {round(time.time() - client.last_seen, 1)} seconds"
+
+
 class RemoteClient:
     def __init__(
         self,
@@ -119,6 +136,7 @@ class RemoteClient:
         self.writer: asyncio.StreamWriter | None = None
         self.remote_screen = RemoteScreen(width=1920, height=1080)
         self._secret = config.secret_for_peer(peer)
+        self.remote_device_id: str | None = None
 
     @property
     def connected(self) -> bool:
@@ -130,45 +148,62 @@ class RemoteClient:
         if not self.peer.host:
             raise ConnectionError(f"{self.peer.name} has no direct host address; waiting for it to connect")
 
-        reader, writer = await asyncio.open_connection(
-            self.peer.host,
-            self.peer.port,
-            limit=_stream_frame_limit(self.config),
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                self.peer.host,
+                self.peer.port,
+                limit=_stream_frame_limit(self.config),
+            ),
+            timeout=CONNECT_TIMEOUT_SECONDS,
         )
         self.reader = reader
         self.writer = writer
         width, height = self.backend.screen_size()
-        await send_message(
-            writer,
-            "hello",
-            {
-                "machine_name": self.config.machine_name,
-                "screen_width": width,
-                "screen_height": height,
-                "client_version": "0.1.0",
-                "capabilities": LOCAL_CAPABILITIES,
-            },
-            self._secret,
-        )
-        ack = await read_message(reader, self._secret)
-        if ack.type != "hello_ack":
-            raise ConnectionError(f"expected hello_ack, got {ack.type!r}")
+        try:
+            await send_message(
+                writer,
+                "hello",
+                {
+                    "machine_name": self.config.machine_name,
+                    "device_id": self.config.device_id,
+                    "screen_width": width,
+                    "screen_height": height,
+                    "client_version": "0.1.0",
+                    "capabilities": LOCAL_CAPABILITIES,
+                },
+                self._secret,
+                timeout=DEFAULT_SEND_TIMEOUT_SECONDS,
+            )
+            ack = await asyncio.wait_for(read_message(reader, self._secret), timeout=CONNECT_TIMEOUT_SECONDS)
+            if ack.type != "hello_ack":
+                raise ConnectionError(f"expected hello_ack, got {ack.type!r}")
+        except Exception:
+            await self.close()
+            raise
 
         self.remote_screen = _screen_from_payload(ack.payload)
+        self.remote_device_id = _optional_string(ack.payload.get("device_id"))
         self.state.update_peer(
             self.peer.name,
+            device_id=self.remote_device_id,
             connected=True,
+            health="connected",
             screen_width=self.remote_screen.width,
             screen_height=self.remote_screen.height,
             last_seen=time.time(),
             error=None,
         )
 
-    async def send(self, message_type: str, payload: dict[str, Any]) -> None:
+    async def send(self, message_type: str, payload: dict[str, Any], *, timeout: float | None = DEFAULT_SEND_TIMEOUT_SECONDS) -> None:
         if not self.connected:
             await self.connect()
         assert self.writer is not None
-        await send_message(self.writer, message_type, payload, self._secret)
+        try:
+            await send_message(self.writer, message_type, payload, self._secret, timeout=timeout)
+        except Exception as exc:
+            self.state.update_peer(self.peer.name, connected=False, health="offline", error=str(exc))
+            await self.close()
+            raise
         self.state.update_peer(self.peer.name, last_seen=time.time(), error=None)
 
     async def close(self) -> None:
@@ -179,7 +214,7 @@ class RemoteClient:
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
-        self.state.update_peer(self.peer.name, connected=False)
+        self.state.update_peer(self.peer.name, connected=False, health="offline")
 
 
 class HostedRemoteClient:
@@ -194,6 +229,8 @@ class HostedRemoteClient:
         remote_screen: RemoteScreen,
         state: StateStore,
         capabilities: dict[str, Any] | None = None,
+        device_id: str | None = None,
+        incoming_key: str | None = None,
     ) -> None:
         self.name = name
         self.reader = reader
@@ -202,27 +239,48 @@ class HostedRemoteClient:
         self.remote_screen = remote_screen
         self.state = state
         self.capabilities = capabilities or {}
+        self.device_id = device_id
+        self.incoming_key = incoming_key
+        self.last_seen = time.time()
 
     @property
     def connected(self) -> bool:
-        return not self.writer.is_closing()
+        return not self.writer.is_closing() and not self.is_stale()
+
+    def is_stale(self, *, now: float | None = None) -> bool:
+        return ((now or time.time()) - self.last_seen) > HEARTBEAT_STALE_SECONDS
+
+    def mark_seen(self) -> None:
+        self.last_seen = time.time()
 
     async def connect(self) -> None:
         if not self.connected:
             raise ConnectionError(f"{self.name} is not connected to this host")
 
-    async def send(self, message_type: str, payload: dict[str, Any]) -> None:
+    async def send(self, message_type: str, payload: dict[str, Any], *, timeout: float | None = DEFAULT_SEND_TIMEOUT_SECONDS) -> None:
         if not self.connected:
             raise ConnectionError(f"{self.name} is not connected to this host")
-        await send_message(self.writer, message_type, payload, self._secret)
-        self.state.update_peer(self.name, last_seen=time.time(), error=None)
+        try:
+            await send_message(self.writer, message_type, payload, self._secret, timeout=timeout)
+        except Exception as exc:
+            self.state.update_peer(self.name, connected=False, health="offline", error=str(exc))
+            await self.close(error=str(exc))
+            raise
+        self.state.update_peer(self.name, connected=True, health="connected", error=None)
 
-    async def close(self) -> None:
+    async def close(self, *, error: str | None = None, health: str = "offline") -> None:
         if not self.writer.is_closing():
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
-        self.state.update_peer(self.name, connected=False)
+        updates: dict[str, Any] = {"connected": False, "health": health}
+        if error is not None:
+            updates["error"] = error
+        self.state.update_peer(self.name, **updates)
+        if self.incoming_key:
+            incoming_updates = dict(updates)
+            incoming_updates["last_seen"] = self.last_seen
+            self.state.update_incoming(self.incoming_key, **incoming_updates)
 
 
 class HostClientRegistry:
@@ -236,14 +294,16 @@ class HostClientRegistry:
         async with self._lock:
             old_client = self._clients.get(client.name)
         if old_client is not None and old_client is not client:
-            await old_client.close()
+            await old_client.close(error="replaced by a newer connection")
 
         async with self._lock:
             self._clients[client.name] = client
 
         self.state.update_peer(
             client.name,
+            device_id=client.device_id,
             connected=True,
+            health="connected",
             screen_width=client.remote_screen.width,
             screen_height=client.remote_screen.height,
             last_seen=time.time(),
@@ -255,19 +315,57 @@ class HostClientRegistry:
         async with self._lock:
             if self._clients.get(name) is client:
                 self._clients.pop(name, None)
-                self.state.update_peer(name, connected=False)
+                self.state.update_peer(name, connected=False, health="offline")
 
     async def get(self, name: str) -> HostedRemoteClient | None:
         async with self._lock:
             client = self._clients.get(name)
-        if client is not None and client.connected:
+        if client is None:
+            return None
+        if client.connected:
             return client
+        if client.is_stale():
+            await self._drop_if_current(name, client, error=_stale_error(client), health="stale")
+            return None
+        await self._drop_if_current(name, client)
         return None
 
     async def connected_clients(self) -> list[HostedRemoteClient]:
         async with self._lock:
             clients = list(self._clients.values())
-        return [client for client in clients if client.connected]
+        healthy: list[HostedRemoteClient] = []
+        for client in clients:
+            if client.connected:
+                healthy.append(client)
+                continue
+            if client.is_stale():
+                await self._drop_if_current(client.name, client, error=_stale_error(client), health="stale")
+            else:
+                await self._drop_if_current(client.name, client)
+        return healthy
+
+    async def prune_stale(self) -> None:
+        async with self._lock:
+            clients = list(self._clients.values())
+        for client in clients:
+            if client.is_stale():
+                await self._drop_if_current(client.name, client, error=_stale_error(client), health="stale")
+
+    async def _drop_if_current(
+        self,
+        name: str,
+        client: HostedRemoteClient,
+        *,
+        error: str | None = None,
+        health: str = "offline",
+    ) -> None:
+        should_close = False
+        async with self._lock:
+            if self._clients.get(name) is client:
+                self._clients.pop(name, None)
+                should_close = True
+        if should_close:
+            await client.close(error=error, health=health)
 
     async def close_all(self) -> None:
         async with self._lock:
@@ -293,6 +391,7 @@ class AgentServer:
         self.clipboard = clipboard
         self._server: asyncio.AbstractServer | None = None
         self._clipboard_task: asyncio.Task[None] | None = None
+        self._stale_task: asyncio.Task[None] | None = None
         self._clipboard_last_seen: str | None = None
 
     async def start(self) -> None:
@@ -314,6 +413,8 @@ class AgentServer:
                 self._send_host_clipboard_changes(),
                 name="mwbc-host-clipboard",
             )
+        if self.host_registry is not None and self._stale_task is None:
+            self._stale_task = asyncio.create_task(self._watch_hosted_client_health(), name="mwbc-host-client-health")
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -328,6 +429,11 @@ class AgentServer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._clipboard_task
             self._clipboard_task = None
+        if self._stale_task is not None:
+            self._stale_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._stale_task
+            self._stale_task = None
         if self._server is None:
             return
         self._server.close()
@@ -340,6 +446,7 @@ class AgentServer:
         peername = str(writer.get_extra_info("peername"))
         incoming_key = peername
         secret = ""
+        role = ""
         try:
             hello_line = await reader.readline()
             if not hello_line:
@@ -349,16 +456,21 @@ class AgentServer:
                 raise AuthenticationError("first frame must be hello")
 
             client_name = str(hello.payload.get("machine_name", peername))
+            device_id = _optional_string(hello.payload.get("device_id"))
             role = str(hello.payload.get("role", "controller"))
             capabilities = hello.payload.get("capabilities")
             if not isinstance(capabilities, dict):
                 capabilities = {}
+            if role == "client":
+                self._validate_hosted_client_identity(client_name, device_id, secret)
             incoming_key = f"{client_name} {peername}"
             self.state.update_incoming(
                 incoming_key,
                 machine_name=client_name,
+                device_id=device_id,
                 peer=peername,
                 connected=True,
+                health="connected",
                 screen_width=hello.payload.get("screen_width"),
                 screen_height=hello.payload.get("screen_height"),
                 capabilities=capabilities,
@@ -374,6 +486,8 @@ class AgentServer:
                     "screen_width": width,
                     "screen_height": height,
                     "server_version": "0.1.0",
+                    "device_id": self.config.device_id,
+                    "capabilities": LOCAL_CAPABILITIES,
                 },
                 secret,
             )
@@ -389,6 +503,8 @@ class AgentServer:
                     remote_screen=_screen_from_payload(hello.payload),
                     state=self.state,
                     capabilities=capabilities,
+                    device_id=device_id,
+                    incoming_key=incoming_key,
                 )
                 await self.host_registry.register(hosted_client)
                 await self._send_client_settings(hosted_client)
@@ -398,7 +514,7 @@ class AgentServer:
 
             while True:
                 message = await read_message(reader, secret)
-                self.state.update_incoming(incoming_key, last_seen=time.time())
+                self.state.update_incoming(incoming_key, connected=True, health="connected", last_seen=time.time())
                 await self._handle_message(message, incoming_key)
         except (AuthenticationError, ConnectionError, asyncio.IncompleteReadError) as exc:
             logger.info("client %s disconnected: %s", peername, exc)
@@ -406,6 +522,8 @@ class AgentServer:
             logger.exception("client %s failed", peername)
             self.state.set_error(str(exc))
         finally:
+            if role and role != "client":
+                reset_backend_input(self.backend)
             self.state.remove_incoming(incoming_key)
             writer.close()
             with contextlib.suppress(Exception):
@@ -415,8 +533,9 @@ class AgentServer:
         try:
             while True:
                 message = await read_message(client.reader, client._secret)
-                self.state.update_incoming(incoming_key, last_seen=time.time())
-                self.state.update_peer(client.name, last_seen=time.time(), error=None)
+                client.mark_seen()
+                self.state.update_incoming(incoming_key, connected=True, health="connected", last_seen=client.last_seen)
+                self.state.update_peer(client.name, connected=True, health="connected", last_seen=client.last_seen, error=None)
                 if message.type == "heartbeat":
                     continue
                 if message.type == "clipboard":
@@ -435,7 +554,7 @@ class AgentServer:
             apply_input_event(self.backend, message.payload)
             self.state.increment("events_received")
         elif message.type == "control":
-            self.backend.reset_modifiers()
+            reset_backend_input(self.backend)
             self.state.update_incoming(incoming_key, active=message.payload.get("active"))
         elif message.type == "clipboard":
             await self._apply_clipboard_message(message, incoming_key)
@@ -537,7 +656,7 @@ class AgentServer:
                 self.state.update(clipboard_error=warning)
                 continue
             try:
-                await client.send("clipboard", wire_payload)
+                await client.send("clipboard", wire_payload, timeout=CLIPBOARD_SEND_TIMEOUT_SECONDS)
                 self.state.update_peer(client.name, error=None)
             except Exception as exc:
                 logger.info("failed to send clipboard to %s: %s", client.name, exc)
@@ -567,7 +686,11 @@ class AgentServer:
             self.state.update(clipboard_error=warning)
             return
         try:
-            await client.send("clipboard", payload.to_wire_payload(self.config.machine_name))
+            await client.send(
+                "clipboard",
+                payload.to_wire_payload(self.config.machine_name),
+                timeout=CLIPBOARD_SEND_TIMEOUT_SECONDS,
+            )
             self.state.update(
                 clipboard_error=None,
                 last_clipboard_source=self.config.machine_name,
@@ -589,6 +712,22 @@ class AgentServer:
                 settings = peer.client_settings()
                 break
         await client.send("settings", settings)
+
+    async def _watch_hosted_client_health(self) -> None:
+        assert self.host_registry is not None
+        while True:
+            await asyncio.sleep(1.0)
+            await self.host_registry.prune_stale()
+
+    def _validate_hosted_client_identity(self, client_name: str, device_id: str | None, secret: str) -> None:
+        known = {peer.name: peer for peer in self.config.peers}
+        peer = known.get(client_name)
+        if peer is None:
+            raise AuthenticationError(f"{client_name} is not configured as a peer")
+        if peer.shared_secret and peer.shared_secret != secret:
+            raise AuthenticationError(f"{client_name} used the wrong peer secret")
+        if peer.device_id and device_id and peer.device_id != device_id:
+            raise AuthenticationError(f"{client_name} device id does not match the configured peer")
 
 
 class ClientConnector:
@@ -654,27 +793,37 @@ class ClientConnector:
         )
         secret = self.config.pairing_secret
         width, height = self.backend.screen_size()
-        await send_message(
-            writer,
-            "hello",
-            {
-                "role": "client",
-                "machine_name": self.config.machine_name,
-                "screen_width": width,
-                "screen_height": height,
-                "client_version": "0.1.0",
-                "capabilities": LOCAL_CAPABILITIES,
-            },
-            secret,
-        )
-        ack = await asyncio.wait_for(read_message(reader, secret), timeout=CONNECT_TIMEOUT_SECONDS)
-        if ack.type != "hello_ack":
-            raise ConnectionError(f"expected hello_ack, got {ack.type!r}")
+        try:
+            await send_message(
+                writer,
+                "hello",
+                {
+                    "role": "client",
+                    "machine_name": self.config.machine_name,
+                    "device_id": self.config.device_id,
+                    "screen_width": width,
+                    "screen_height": height,
+                    "client_version": "0.1.0",
+                    "capabilities": LOCAL_CAPABILITIES,
+                },
+                secret,
+                timeout=DEFAULT_SEND_TIMEOUT_SECONDS,
+            )
+            ack = await asyncio.wait_for(read_message(reader, secret), timeout=CONNECT_TIMEOUT_SECONDS)
+            if ack.type != "hello_ack":
+                raise ConnectionError(f"expected hello_ack, got {ack.type!r}")
+        except Exception:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            reset_backend_input(self.backend)
+            raise
 
         self.state.update(
             host_connected=True,
             host_error=None,
             host_name=ack.payload.get("machine_name"),
+            host_device_id=ack.payload.get("device_id"),
             host_screen_width=ack.payload.get("screen_width"),
             host_screen_height=ack.payload.get("screen_height"),
         )
@@ -710,6 +859,7 @@ class ClientConnector:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
             self._host_active = False
+            reset_backend_input(self.backend)
             self.state.update(host_connected=False, host_active=False)
 
     async def _read_host_messages(
@@ -762,7 +912,13 @@ class ClientConnector:
             if payload.signature == self._clipboard_last_seen:
                 continue
             self._clipboard_last_seen = payload.signature
-            await send_message(writer, "clipboard", payload.to_wire_payload(self.config.machine_name), secret)
+            await send_message(
+                writer,
+                "clipboard",
+                payload.to_wire_payload(self.config.machine_name),
+                secret,
+                timeout=CLIPBOARD_SEND_TIMEOUT_SECONDS,
+            )
             self.state.update(
                 clipboard_error=None,
                 last_clipboard_sent=time.time(),
@@ -789,7 +945,7 @@ class ClientConnector:
             apply_input_event(self.backend, message.payload)
             self.state.increment("events_received")
         elif message.type == "control":
-            self.backend.reset_modifiers()
+            reset_backend_input(self.backend)
             self._host_active = bool(message.payload.get("active"))
             self.state.update(host_active=self._host_active)
         elif message.type == "clipboard":
@@ -853,6 +1009,7 @@ class ClientConnector:
                     "bytes": size,
                 },
                 secret,
+                timeout=CLIPBOARD_SEND_TIMEOUT_SECONDS,
             )
         except Exception as exc:
             logger.info("failed to send clipboard acknowledgement: %s", exc)

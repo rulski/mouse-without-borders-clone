@@ -51,7 +51,7 @@ mwbc init --name DESKTOP
 
 Copy the printed `pairing_secret` so both machines use the same value in `~/.mwbc/config.json`.
 
-On the host machine whose mouse and keyboard you want to use, add each client by name and edge. The name must match the client's `machine_name` in its config.
+On the host machine whose mouse and keyboard you want to use, add each client by name and edge. The name must match the client's `machine_name` in its config. Always-looking clients must be listed on the host before they are allowed to connect.
 
 ```bash
 mwbc add-peer --name LAPTOP --edge right
@@ -132,7 +132,11 @@ GET /api/status
 GET /api/layout
 GET /api/capabilities
 GET /api/service
+GET /api/v1/status
+GET /api/v1/service
 ```
+
+The public service response intentionally omits secret-bearing controller and layout URLs. Send `X-MWBC-Token` with `GET /api/service` or `GET /api/v1/service` when Smith needs those private URLs.
 
 Authenticated endpoints require the pairing secret in `X-MWBC-Token`:
 
@@ -326,3 +330,18 @@ mwbc run --backend null
 - Open TCP port `45446` when using browser controller mode from another device.
 - Keep the dashboard bound to `127.0.0.1` unless you intentionally want it reachable from the LAN.
 - File drag/drop, auto-discovery, and per-monitor geometry are natural next additions.
+
+## Source-checkout verification and recovery
+
+The standard-library suite can run directly from this source checkout without
+installing native input hooks:
+
+```bash
+PYTHONPATH=src python3 -m unittest discover -s tests
+```
+
+Actual keyboard, pointer, clipboard, tray, and startup behavior still needs
+testing in the desktop OS session. Pairing configuration is stored outside
+this repository at `~/.mwbc/config.json`; keep it in an approved private
+recovery location. GitHub contains committed code only. Preserve existing
+uncommitted code and documentation changes in a separate source snapshot.

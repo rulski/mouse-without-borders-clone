@@ -111,10 +111,16 @@ def make_replay_backend() -> tuple[PynputBackend, FakeKeyboardController]:
 def make_mouse_backend(*, coalesce: bool = False) -> tuple[PynputBackend, FakeMouseController]:
     backend = object.__new__(PynputBackend)
     controller = FakeMouseController()
+    backend._keyboard_module = FakeKeyboardModule
+    backend._keyboard_controller = FakeKeyboardController()
     backend._mouse_module = FakeMouseModule
     backend._mouse_controller = controller
+    backend._replay_shift_keys = set()
+    backend._replay_one_shot_chars = set()
+    backend._shift_down = False
     backend._pending_click_presses = {}
     backend._pending_tap_clicks = {}
+    backend._pressed_buttons = set()
     backend._click_lock = threading.RLock()
     backend._coalesce_tap_clicks = coalesce
     backend._screen_origin = (0, 0)
@@ -308,6 +314,26 @@ class InputBackendTests(unittest.TestCase):
             controller.events,
             [("press", "LEFT"), ("move_relative", (4, 5)), ("release", "LEFT")],
         )
+
+    def test_reset_input_releases_pressed_mouse_buttons(self) -> None:
+        backend, controller = make_mouse_backend()
+
+        backend.click("left", True)
+        backend.reset_input()
+
+        self.assertEqual(controller.events[:2], [("press", "LEFT"), ("release", "LEFT")])
+        self.assertEqual(backend._pressed_buttons, set())
+
+    def test_reset_input_cancels_pending_coalesced_clicks(self) -> None:
+        backend, controller = make_mouse_backend(coalesce=True)
+
+        backend.click("left", True)
+        backend.click("left", False)
+        backend.reset_input()
+
+        self.assertEqual(controller.events, [("release", "LEFT"), ("release", "MIDDLE"), ("release", "RIGHT")])
+        self.assertEqual(backend._pending_tap_clicks, {})
+        self.assertTrue(backend._fake_timers[0][1].canceled)
 
 
 if __name__ == "__main__":

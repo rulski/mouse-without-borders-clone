@@ -18,6 +18,7 @@ ManagementHandler = Callable[[str, dict[str, Any]], dict[str, Any]]
 MANAGEMENT_GET_ROUTES: dict[str, tuple[str, bool]] = {
     "/api/capabilities": ("capabilities", False),
     "/api/service": ("service.status", False),
+    "/api/v1/service": ("service.status", False),
     "/api/startup": ("startup.status", True),
     "/api/logs": ("logs", True),
 }
@@ -81,6 +82,9 @@ class DashboardServer:
                 parsed = urlparse(self.path)
                 if parsed.path in {"/api/status", "/status.json"}:
                     self._send_json(state_provider())
+                    return
+                if parsed.path == "/api/v1/status":
+                    self._send_json({"api_version": 1, "state": state_provider()})
                     return
                 if parsed.path == "/api/layout":
                     self._send_json(current_layout())
@@ -173,12 +177,15 @@ class DashboardServer:
                     return
 
                 action, requires_auth = MANAGEMENT_GET_ROUTES[parsed.path]
-                if requires_auth and not _token_matches(self._auth_token({}, parsed.query), auth_tokens):
+                authorized = _token_matches(self._auth_token({}, parsed.query), auth_tokens)
+                if requires_auth and not authorized:
                     self._send_json({"ok": False, "error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
                     return
 
                 try:
-                    result = dict(management_handler(action, self._query_payload(parsed.query)))
+                    payload = self._query_payload(parsed.query)
+                    payload["_authenticated"] = authorized
+                    result = dict(management_handler(action, payload))
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
                     return
