@@ -51,6 +51,47 @@ class FakeRemoteClient:
 
 
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_return_discards_remote_key_and_motion_backlog(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        controller = BorderController(AppConfig(peers=[peer]), NullBackend(), StateStore("host", "null"))
+        controller.active = ActiveRemote(peer, FakeRemoteClient(), Point(100, 100))
+        controller._enqueue_nowait("move", (0, 100))
+        controller._enqueue_nowait("key_press", ({"kind": "char", "value": "w"},))
+        await controller._return_local("test return", mark_disconnected=False)
+        self.assertTrue(controller.queue.empty())
+
+    async def test_queue_pressure_preserves_ordered_transitions(self) -> None:
+        controller = BorderController(AppConfig(), NullBackend(), StateStore("host", "null"))
+        controller.queue = asyncio.Queue(maxsize=3)
+        controller._enqueue_nowait("key_press", ({"kind": "char", "value": "a"},))
+        controller._enqueue_nowait("move", (1, 2))
+        controller._enqueue_nowait("click", (1, 2, "left", True))
+        controller._enqueue_nowait("key_release", ({"kind": "char", "value": "a"},))
+        self.assertEqual([controller.queue.get_nowait()[0] for _ in range(3)],
+                         ["key_press", "click", "key_release"])
+
+    async def test_transition_saturation_returns_home_and_locks(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        state = StateStore("host", "null")
+        controller = BorderController(AppConfig(peers=[peer]), NullBackend(), state)
+        client = FakeRemoteClient()
+        controller.active = ActiveRemote(peer, client, Point(100, 100))
+        controller.queue = asyncio.Queue(maxsize=2)
+        controller._enqueue_nowait("key_press", ({"kind": "char", "value": "a"},))
+        controller._enqueue_nowait("key_press", ({"kind": "char", "value": "b"},))
+        controller._enqueue_nowait("key_release", ({"kind": "char", "value": "a"},))
+        task = asyncio.create_task(controller._event_pump())
+        try:
+            await asyncio.sleep(0.1)
+            self.assertIsNone(controller.active)
+            self.assertTrue(controller.edge_switching_paused)
+            self.assertEqual(client.sent[-1], ("control", {"active": False}))
+            self.assertTrue(controller.queue.empty())
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
     async def test_refresh_peers_updates_edges_and_direct_clients(self) -> None:
         config = AppConfig(machine_name="host", peers=[PeerConfig(name="mac", edge="left")])
         backend = NullBackend()

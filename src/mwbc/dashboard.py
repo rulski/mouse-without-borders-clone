@@ -712,7 +712,13 @@ def render_web_controller(state: dict) -> str:
     document.getElementById("start").addEventListener("click", start);
     document.getElementById("stop").addEventListener("click", stop);
     pad.addEventListener("click", start);
-    document.addEventListener("pointerlockchange", setLockUi);
+    document.addEventListener("pointerlockchange", () => {{
+      if (!locked()) {{
+        queue = [{{ action: "reset_input" }}];
+        flush();
+      }}
+      setLockUi();
+    }});
 
     document.addEventListener("mousemove", (event) => {{
       if (!locked()) return;

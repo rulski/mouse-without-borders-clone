@@ -333,6 +333,24 @@ mwbc run --backend null
 
 ## Source-checkout verification and recovery
 
+The authoritative development checkout on the current workstation is
+`/home/rulski/Projects/mouse-without-borders-clone` inside Ubuntu/WSL. The
+source-only Windows folder at `C:\Users\rulski\Projects\mouse-without-borders-clone`
+is an older copy, not the Git checkout. Update desktop installations from
+committed GitHub revisions; do not assume that editing the WSL checkout updates
+an existing Windows installation.
+
+Input queue saturation now discards motion first. If ordered key/button
+transitions still cannot fit, MWBC aborts remote control and locks to the host
+until F12 resumes switching. Receivers release injected ordinary keys as well
+as modifiers and mouse buttons during reset. Update both host and client for
+the full recovery behavior.
+
+Security hardening remains pending: the TCP protocol is signed but not encrypted,
+and message nonces are not yet checked for replay. Use only on a trusted LAN.
+The next stages are verified encrypted pairing and role/replay enforcement,
+followed by unambiguous layout routing and clipboard responsiveness.
+
 The standard-library suite can run directly from this source checkout without
 installing native input hooks:
 

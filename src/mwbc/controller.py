@@ -138,18 +138,20 @@ class BorderController:
 
     def _enqueue_nowait(self, event_type: str, values: tuple[Any, ...]) -> None:
         if self.queue.full():
-            if event_type == "move":
-                self._drop_queued_motion_events()
-            else:
-                self._drop_oldest_event()
+            self._drop_queued_motion_events()
+            if self.queue.full():
+                if event_type == "move":
+                    self.state.increment("events_dropped")
+                    return
+                # Ordered transitions cannot be discarded safely. Abort this
+                # control session before accepting any further remote input.
+                while not self.queue.empty():
+                    self.queue.get_nowait()
+                self.queue.put_nowait(("input_overflow", ()))
+                return
         try:
             self.queue.put_nowait((event_type, values))
         except asyncio.QueueFull:
-            self.state.increment("events_dropped")
-
-    def _drop_oldest_event(self) -> None:
-        with contextlib.suppress(asyncio.QueueEmpty):
-            self.queue.get_nowait()
             self.state.increment("events_dropped")
 
     def _drop_queued_motion_events(self) -> None:
@@ -170,11 +172,22 @@ class BorderController:
         if dropped:
             self.state.increment("events_dropped", dropped)
 
+    def _discard_remote_backlog(self) -> None:
+        while not self.queue.empty():
+            event_type, values = self.queue.get_nowait()
+            if event_type == "key_release" and _is_host_lock_hotkey(values[0]):
+                self._host_lock_pressed = False
+            self.state.increment("events_dropped")
+
     async def _event_pump(self) -> None:
         while True:
             event_type, values = await self.queue.get()
             try:
-                if event_type == "move":
+                if event_type == "input_overflow":
+                    self.edge_switching_paused = True
+                    self.state.update(edge_switching_paused=True)
+                    await self._recover_local("input queue overloaded; host locked for safety")
+                elif event_type == "move":
                     await self._handle_move(int(values[0]), int(values[1]))
                 elif event_type == "click":
                     await self._handle_click(int(values[0]), int(values[1]), str(values[2]), bool(values[3]))
@@ -239,7 +252,7 @@ class BorderController:
             self.state.set_error(f"{active.peer.name}: {control_error}")
         local_point = self._local_return_point(active)
         await self._restore_local_pointer(local_point)
-        self._drop_queued_motion_events()
+        self._discard_remote_backlog()
         self._ignore_next_lock_motion = False
         self._ignore_lock_motion_until = 0.0
         self.state.update(
@@ -454,7 +467,7 @@ class BorderController:
         except Exception as exc:
             control_error = exc
         await self._restore_local_pointer(local_point)
-        self._drop_queued_motion_events()
+        self._discard_remote_backlog()
         self._ignore_next_lock_motion = False
         self._ignore_lock_motion_until = 0.0
         self.state.update(

@@ -137,6 +137,20 @@ def make_mouse_backend(*, coalesce: bool = False) -> tuple[PynputBackend, FakeMo
 
 
 class InputBackendTests(unittest.TestCase):
+    def test_reset_input_releases_ordinary_held_keys(self) -> None:
+        backend, keyboard = make_replay_backend()
+        mouse_backend, mouse = make_mouse_backend()
+        backend._mouse_module = mouse_backend._mouse_module
+        backend._mouse_controller = mouse
+        backend._click_lock = threading.RLock()
+        backend._pending_tap_clicks = {}
+        backend._pending_click_presses = {}
+        backend._pressed_buttons = set()
+        backend.key_press({"kind": "char", "value": "w"})
+        backend.reset_input()
+        self.assertIn(("release", "w"), keyboard.events)
+        self.assertEqual(backend._pressed_keys, {})
+
     def test_windows_virtual_screen_uses_full_desktop_area(self) -> None:
         user32 = FakeUser32(
             {

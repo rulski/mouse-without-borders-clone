@@ -178,6 +178,7 @@ class PynputBackend:
         self._shift_down = False
         self._replay_shift_keys: set[str] = set()
         self._replay_one_shot_chars: set[str] = set()
+        self._pressed_keys: dict[tuple[str, str], dict[str, str]] = {}
         self._pending_click_presses: dict[str, Any] = {}
         self._pending_tap_clicks: dict[str, PendingTapClick] = {}
         self._pressed_buttons: set[Any] = set()
@@ -253,6 +254,9 @@ class PynputBackend:
         self._mouse_controller.scroll(int(dx), int(dy))
 
     def key_press(self, key: dict[str, str]) -> None:
+        if not hasattr(self, "_pressed_keys"):
+            self._pressed_keys = {}
+        self._pressed_keys[(key.get("kind", ""), key.get("value", ""))] = dict(key)
         if _is_shift_wire(key):
             self._replay_shift_keys.add(_shift_wire_value(key))
             self._keyboard_controller.press(self._key_from_wire(key))
@@ -267,6 +271,7 @@ class PynputBackend:
         self._keyboard_controller.press(self._key_from_wire(key))
 
     def key_release(self, key: dict[str, str]) -> None:
+        getattr(self, "_pressed_keys", {}).pop((key.get("kind", ""), key.get("value", "")), None)
         if _is_shift_wire(key):
             try:
                 self._keyboard_controller.release(self._key_from_wire(key))
@@ -292,6 +297,13 @@ class PynputBackend:
                 logger.debug("failed to release modifier %r", key, exc_info=True)
 
     def reset_input(self) -> None:
+        pressed = list(getattr(self, "_pressed_keys", {}).values())
+        for key in pressed:
+            try:
+                self.key_release(key)
+            except Exception:
+                logger.debug("failed to release injected key", exc_info=True)
+        getattr(self, "_pressed_keys", {}).clear()
         self.reset_modifiers()
         self._reset_mouse_buttons()
 
