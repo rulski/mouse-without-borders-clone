@@ -87,6 +87,12 @@ Press `F12` on the host to toggle host lock. When host lock is on, edge switchin
 
 ## Secure Pairing
 
+For this local lab, the Windows host's public identity is available at
+[`pairing/host-public.json`](pairing/host-public.json). After pulling the repo,
+use that path instead of transferring `host-public.json` separately. This is
+public certificate material only; private keys and tokens are not published.
+Verify its fingerprint against the originating Windows host before approval.
+
 Upgrade the package on both devices (`pip install -e ".[input,tray]"` in each
 checkout). Keep native Windows/macOS processes in their desktop OS sessions.
 Do not restart a working older installation until both sides are ready.
