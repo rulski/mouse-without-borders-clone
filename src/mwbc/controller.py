@@ -342,12 +342,18 @@ class BorderController:
         for peer in self.config.peers:
             if not should_activate(peer.edge, point, self.local_size, self.config.edge_threshold_px):
                 continue
+            if sum(item.edge == peer.edge for item in self.config.peers) > 1:
+                self.state.set_error(f"Multiple devices use {peer.edge}; assign one device per edge in Layout")
+                return
 
+            activation_edge = peer.edge
             try:
                 client = await self._resolve_client(peer)
             except Exception as exc:
                 self.state.update_peer(peer.name, connected=False, error=str(exc))
                 self.state.set_error(f"{peer.name}: {exc}")
+                return
+            if peer.edge != activation_edge:
                 return
 
             remote_size = Size(client.remote_screen.width, client.remote_screen.height)

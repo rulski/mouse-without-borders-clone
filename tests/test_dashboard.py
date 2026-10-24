@@ -62,6 +62,31 @@ class DashboardTests(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_browser_control_is_unavailable_without_input_handler(self) -> None:
+        server = self._layout_server()
+        try:
+            body = urllib.request.urlopen(f"{self._base_url(server)}/controller", timeout=3).read().decode("utf-8")
+            self.assertIn("Browser control unavailable", body)
+            self.assertNotIn("requestPointerLock", body)
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self._post(server, {"events": [{"action": "key_press", "key": "a"}]}, token="secret")
+            self.assertEqual(raised.exception.code, 503)
+        finally:
+            server.stop()
+
+    def test_public_pages_do_not_embed_server_credentials(self) -> None:
+        server = self._layout_server()
+        try:
+            for path in ("/", "/layout", "/controller"):
+                body = urllib.request.urlopen(f"{self._base_url(server)}{path}", timeout=3).read().decode("utf-8")
+                self.assertNotIn("secret", body)
+                self.assertIn("data-mwbc-nav", body)
+                self.assertIn("window.location.hash", body)
+                self.assertNotIn("sessionStorage", body)
+                self.assertNotIn("localStorage", body)
+        finally:
+            server.stop()
+
     def test_layout_api_requires_token(self) -> None:
         server = self._layout_server()
         try:

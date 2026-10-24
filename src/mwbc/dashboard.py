@@ -100,7 +100,8 @@ class DashboardServer:
                     self._handle_management_get(parsed)
                     return
                 if parsed.path == "/controller":
-                    self._send_html(render_web_controller(state_provider()))
+                    self._send_html(render_web_controller(state_provider()) if web_input_handler is not None
+                                    else render_controller_unavailable())
                     return
                 if parsed.path == "/layout":
                     self._send_html(render_layout_editor(current_layout()))
@@ -287,6 +288,32 @@ def _safe(value: object) -> str:
     return html.escape("" if value is None else str(value))
 
 
+def _navigation_script() -> str:
+    # Fragments stay in this tab's URL, not public responses or persistent storage.
+    return """<script>
+    const mwbcToken = new URLSearchParams(window.location.hash.slice(1)).get("token") || "";
+    if (mwbcToken) {
+      document.querySelectorAll("a[data-mwbc-nav]").forEach((link) => {
+        const target = new URL(link.href);
+        if (target.origin === window.location.origin && ["/", "/layout", "/controller"].includes(target.pathname)) {
+          target.hash = new URLSearchParams({token: mwbcToken}).toString();
+          link.href = target.href;
+        }
+      });
+    }
+    </script>"""
+
+
+def render_controller_unavailable() -> str:
+    return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MWBC Controller Unavailable</title></head>
+<body><main><h1>Browser control unavailable</h1>
+<p>Browser input is disabled pending disconnect-recovery safeguards. Native device sharing is unchanged.</p>
+<a data-mwbc-nav href="/">Dashboard</a></main>""" + _navigation_script() + "</body></html>"
+
+
 def render_dashboard(state: dict) -> str:
     peers = state.get("peers", [])
     incoming = state.get("incoming_clients", {})
@@ -406,8 +433,7 @@ def render_dashboard(state: dict) -> str:
         <div class="meta">Mouse Without Borders Clone</div>
       </div>
       <div class="actions">
-        <a class="pill" href="/controller">Controller</a>
-        <a class="pill" href="/layout">Layout</a>
+        <a class="pill" data-mwbc-nav href="/layout">Layout</a>
         <div class="pill">Active: {_safe(active_peer)}</div>
       </div>
     </header>
@@ -433,6 +459,7 @@ def render_dashboard(state: dict) -> str:
       </table>
     </section>
   </main>
+  {_navigation_script()}
 </body>
 </html>"""
 
@@ -837,7 +864,10 @@ def render_layout_editor(layout: dict) -> str:
       cursor: pointer;
     }
     button.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 700; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
     .status {
+      min-width: 0;
+      max-width: 100%;
       min-height: 36px;
       display: inline-flex;
       align-items: center;
@@ -970,9 +1000,9 @@ def render_layout_editor(layout: dict) -> str:
         <div class="meta">Host: __HOST__</div>
       </div>
       <div class="toolbar">
-        <a href="/">Dashboard</a>
+        <a data-mwbc-nav href="/">Dashboard</a>
         <button id="save" class="primary" type="button">Save</button>
-        <div id="status" class="status">Ready</div>
+        <div id="status" class="status" role="status" aria-live="polite">Ready</div>
       </div>
     </header>
     <section class="stage" aria-label="Device layout">
@@ -1004,13 +1034,14 @@ def render_layout_editor(layout: dict) -> str:
     const initialLayout = __LAYOUT__;
     const edgeLabels = { left: "Left", top: "Top", right: "Right", bottom: "Bottom" };
     const validEdges = Object.keys(edgeLabels);
-    const tokenParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
-    const queryParams = new URLSearchParams(window.location.search);
-    const token = tokenParams.get("token") || queryParams.get("token") || "";
+    const token = mwbcToken;
     const statusEl = document.getElementById("status");
     const saveButton = document.getElementById("save");
     let draggedName = "";
     let peers = normalizePeers(initialLayout.peers);
+    let dirty = false;
+    let saving = false;
+    const cards = new Map();
 
     function normalizePeers(items) {
       return (Array.isArray(items) ? items : [])
@@ -1051,7 +1082,7 @@ def render_layout_editor(layout: dict) -> str:
     function createDevice(peer) {
       const card = document.createElement("article");
       card.className = "device" + (peer.connected ? " connected" : "") + (!peer.host ? " outbound" : "");
-      card.draggable = true;
+      card.draggable = Boolean(token);
       card.dataset.name = peer.name;
 
       const text = document.createElement("div");
@@ -1065,6 +1096,7 @@ def render_layout_editor(layout: dict) -> str:
 
       const select = document.createElement("select");
       select.setAttribute("aria-label", "Edge for " + peer.name);
+      select.disabled = !token;
       for (const edge of validEdges) {
         const option = document.createElement("option");
         option.value = edge;
@@ -1081,6 +1113,8 @@ def render_layout_editor(layout: dict) -> str:
       keepAwakeLabel.className = "feature-row";
       const keepAwake = document.createElement("input");
       keepAwake.type = "checkbox";
+      keepAwake.setAttribute("aria-label", "Keep awake for " + peer.name);
+      keepAwake.disabled = !token;
       keepAwake.checked = peer.keep_awake;
       keepAwake.addEventListener("change", () => updateFeature(peer.name, {
         keep_awake: keepAwake.checked
@@ -1091,12 +1125,15 @@ def render_layout_editor(layout: dict) -> str:
       intervalLabel.className = "feature-row";
       const interval = document.createElement("input");
       interval.type = "number";
+      interval.setAttribute("aria-label", "Keep-awake interval for " + peer.name);
+      interval.disabled = !token || !peer.keep_awake;
       interval.min = "5";
       interval.max = "3600";
-      interval.step = "5";
+      interval.step = "1";
+      interval.required = true;
       interval.value = String(peer.keep_awake_interval_seconds);
-      interval.addEventListener("change", () => updateFeature(peer.name, {
-        keep_awake_interval_seconds: normalizeInterval(interval.value)
+      interval.addEventListener("input", () => updateFeature(peer.name, {
+        keep_awake_interval_seconds: Number(interval.value)
       }));
       intervalLabel.append(document.createTextNode("Every"), interval, document.createTextNode("sec"));
 
@@ -1104,12 +1141,15 @@ def render_layout_editor(layout: dict) -> str:
       scrollLabel.className = "feature-row";
       const scrollSpeed = document.createElement("input");
       scrollSpeed.type = "number";
+      scrollSpeed.setAttribute("aria-label", "Scroll speed for " + peer.name);
+      scrollSpeed.disabled = !token;
       scrollSpeed.min = "1";
       scrollSpeed.max = "8";
-      scrollSpeed.step = "0.5";
+      scrollSpeed.step = "0.1";
+      scrollSpeed.required = true;
       scrollSpeed.value = String(peer.scroll_multiplier);
-      scrollSpeed.addEventListener("change", () => updateFeature(peer.name, {
-        scroll_multiplier: normalizeScrollMultiplier(scrollSpeed.value)
+      scrollSpeed.addEventListener("input", () => updateFeature(peer.name, {
+        scroll_multiplier: Number(scrollSpeed.value)
       }));
       scrollLabel.append(document.createTextNode("Scroll"), scrollSpeed, document.createTextNode("x"));
 
@@ -1117,6 +1157,7 @@ def render_layout_editor(layout: dict) -> str:
 
       card.append(text, select, controls);
       card.addEventListener("dragstart", (event) => {
+        if (!token || saving) { event.preventDefault(); return; }
         draggedName = peer.name;
         event.dataTransfer.effectAllowed = "move";
         event.dataTransfer.setData("text/plain", peer.name);
@@ -1125,11 +1166,23 @@ def render_layout_editor(layout: dict) -> str:
     }
 
     function render() {
-      document.querySelectorAll(".device-list").forEach((list) => list.replaceChildren());
+      document.querySelectorAll(".device-list .empty").forEach((empty) => empty.remove());
+      const focused = document.activeElement;
       for (const peer of peers) {
         const list = document.querySelector('.device-list[data-edge="' + peer.edge + '"]');
-        if (list) list.append(createDevice(peer));
+        let card = cards.get(peer.name);
+        if (!card) { card = createDevice(peer); cards.set(peer.name, card); }
+        if (list && card.parentElement !== list) list.append(card);
+        const select = card.querySelector("select");
+        select.value = peer.edge;
+        select.disabled = !token || saving;
+        card.draggable = Boolean(token) && !saving;
+        const inputs = card.querySelectorAll("input");
+        inputs[0].disabled = !token || saving;
+        inputs[1].disabled = !token || saving || !peer.keep_awake;
+        inputs[2].disabled = !token || saving;
       }
+      if (focused && focused.isConnected && !focused.disabled) focused.focus({preventScroll: true});
       for (const list of document.querySelectorAll(".device-list")) {
         if (list.children.length === 0) {
           const empty = document.createElement("div");
@@ -1138,32 +1191,43 @@ def render_layout_editor(layout: dict) -> str:
           list.append(empty);
         }
       }
+      saveButton.disabled = !token || !dirty || saving;
     }
 
     function setEdge(name, edge) {
-      if (!validEdges.includes(edge)) return;
+      if (!token || saving || !validEdges.includes(edge)) return;
       const peer = peers.find((item) => item.name === name);
       if (!peer || peer.edge === edge) return;
       peer.edge = edge;
+      dirty = true;
       render();
-      saveLayout();
+      setStatus("Unsaved changes");
     }
 
     function updateFeature(name, updates) {
+      if (!token || saving) return;
       const peer = peers.find((item) => item.name === name);
       if (!peer) return;
       Object.assign(peer, updates);
-      peer.keep_awake_interval_seconds = normalizeInterval(peer.keep_awake_interval_seconds);
-      peer.scroll_multiplier = normalizeScrollMultiplier(peer.scroll_multiplier);
+      dirty = true;
       render();
-      saveLayout();
+      setStatus("Unsaved changes");
     }
 
     async function saveLayout() {
+      if (saving || !dirty) return;
       if (!token) {
-        setStatus("Missing token");
+        setStatus("Read-only: open Layout from the tray or Smith with authorization.");
         return;
       }
+      for (const input of document.querySelectorAll("input[type=number]")) {
+        if (!input.disabled && !input.reportValidity()) {
+          setStatus("Check the highlighted value.");
+          return;
+        }
+      }
+      saving = true;
+      render();
       setStatus("Saving");
       try {
         const response = await fetch("/api/layout", {
@@ -1186,11 +1250,13 @@ def render_layout_editor(layout: dict) -> str:
         if (!response.ok || !result.ok) {
           throw new Error(result.error || "save failed");
         }
-        peers = normalizePeers(result.peers || peers);
-        render();
+        dirty = false;
         setStatus("Saved");
       } catch (error) {
         setStatus(error.message || "Save failed");
+      } finally {
+        saving = false;
+        render();
       }
     }
 
@@ -1209,11 +1275,15 @@ def render_layout_editor(layout: dict) -> str:
     });
 
     saveButton.addEventListener("click", saveLayout);
-    if (!token) setStatus("Missing token");
+    if (!token) setStatus("Read-only: open Layout from the tray or Smith with authorization.");
+    window.addEventListener("beforeunload", (event) => {
+      if (dirty) { event.preventDefault(); event.returnValue = ""; }
+    });
     render();
   </script>
 </body>
 </html>"""
+    template = template.replace("  <script>", "  " + _navigation_script() + "\n  <script>", 1)
     return template.replace("__HOST__", host_name).replace("__LAYOUT__", layout_json)
 
 

@@ -6,12 +6,13 @@ import contextlib
 import json
 import os
 import logging
+import math
 import signal
 import socket
 import subprocess
 import sys
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from .config import (
     load_config,
     normalize_scroll_multiplier,
     save_config,
+    validate_peer_edges,
 )
 from .clipboard import create_clipboard
 from .controller import BorderController
@@ -201,8 +203,9 @@ def cmd_add_peer(args: argparse.Namespace) -> int:
         port=args.port,
         shared_secret=args.shared_secret,
     )
-    config.peers = [peer for peer in config.peers if peer.name != replacement.name]
-    config.peers.append(replacement)
+    proposed = [peer for peer in config.peers if peer.name != replacement.name] + [replacement]
+    validate_peer_edges(proposed)
+    config.peers = proposed
     save_config(config, args.config)
     print(f"Saved peer {replacement.name!r} in {args.config.expanduser()}")
     return 0
@@ -287,10 +290,12 @@ def _build_layout_update_handler(
             edge = str(item.get("edge") or "").lower().strip()
             if not name:
                 raise ValueError("peer is missing a name")
+            if name in updates_by_name:
+                raise ValueError(f"duplicate peer update: {name}")
             if edge not in VALID_EDGES:
                 raise ValueError(f"invalid edge {edge!r}; expected one of {sorted(VALID_EDGES)}")
             interval = float(item.get("keep_awake_interval_seconds", 45.0))
-            if interval < 5 or interval > 3600:
+            if not math.isfinite(interval) or interval < 5 or interval > 3600:
                 raise ValueError("keep-awake interval must be between 5 and 3600 seconds")
             updates_by_name[name] = {
                 "edge": edge,
@@ -300,37 +305,53 @@ def _build_layout_update_handler(
             if "scroll_multiplier" in item:
                 updates_by_name[name]["scroll_multiplier"] = normalize_scroll_multiplier(item.get("scroll_multiplier"))
 
-        with layout_lock:
+        def commit() -> dict[str, Any]:
             known = {peer.name: peer for peer in config.peers}
             unknown = sorted(name for name in updates_by_name if name not in known)
             if unknown:
                 raise ValueError(f"unknown peer: {', '.join(unknown)}")
 
-            for name, updates in updates_by_name.items():
-                peer = known[name]
-                peer.edge = updates["edge"]
-                peer.keep_awake = updates["keep_awake"]
-                peer.keep_awake_interval_seconds = updates["keep_awake_interval_seconds"]
-                if "scroll_multiplier" in updates:
-                    peer.scroll_multiplier = updates["scroll_multiplier"]
-            save_config(config, config_path)
+            proposed = [replace(peer, **updates_by_name.get(peer.name, {})) for peer in config.peers]
+            validate_peer_edges(proposed)
+            controller = controller_ref.get("controller")
+            active = controller.active if controller is not None else None
+            if active is not None:
+                updated_edge = updates_by_name.get(active.peer.name, {}).get("edge", active.peer.edge)
+                if updated_edge != active.peer.edge:
+                    raise ValueError(f"Return control to the host with F12 before moving {active.peer.name}")
+
+            # Persist a complete valid candidate before changing the running state.
+            save_config(replace(config, peers=proposed), config_path)
+            for peer, candidate in zip(config.peers, proposed):
+                peer.edge = candidate.edge
+                peer.keep_awake = candidate.keep_awake
+                peer.keep_awake_interval_seconds = candidate.keep_awake_interval_seconds
+                peer.scroll_multiplier = candidate.scroll_multiplier
             for peer in config.peers:
                 state.register_peer(peer.name, peer.host, peer.port, peer.edge, peer.device_id)
+            return _layout_snapshot(config, state)
 
-        controller = controller_ref.get("controller")
-        if controller is not None and controller.loop is not None and controller.loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(controller.refresh_peers(), controller.loop)
-            future.result(timeout=2)
+        async def notify() -> None:
+            try:
+                controller = controller_ref.get("controller")
+                if controller is not None:
+                    await controller.refresh_peers()
+                if host_registry is not None and updates_by_name:
+                    await _send_peer_settings(config, host_registry, updates_by_name.keys())
+            except Exception:
+                logging.getLogger(__name__).exception("Layout saved, but refreshing connected devices failed")
 
-        if host_registry is not None and updates_by_name:
-            future = asyncio.run_coroutine_threadsafe(
-                _send_peer_settings(config, host_registry, updates_by_name.keys()),
-                loop,
-            )
-            future.result(timeout=2)
+        async def commit_on_loop() -> dict[str, Any]:
+            # No await between the active-session check and commit: input cannot
+            # activate a peer against geometry that is about to change.
+            result = commit()
+            asyncio.create_task(notify(), name="mwbc-layout-refresh")
+            return result
 
         with layout_lock:
-            return _layout_snapshot(config, state)
+            if loop.is_running():
+                return asyncio.run_coroutine_threadsafe(commit_on_loop(), loop).result()
+            return commit()
 
     return handle
 
@@ -454,6 +475,7 @@ def _capabilities_payload() -> dict[str, Any]:
             },
         },
         "logs": True,
+        "web_input": False,
         "api_version": 1,
         "security": {
             "transport": "mutual_tls",
@@ -492,7 +514,6 @@ def _service_status_payload(
     }
     if include_private and args.command in {"run", "host"}:
         payload["layout_url"] = _layout_url(config)
-        payload["controller_url"] = _controller_url(config)
     return payload
 
 
@@ -621,7 +642,6 @@ async def cmd_run(args: argparse.Namespace) -> int:
             config.dashboard_port,
             state.snapshot,
             auth_tokens=auth_tokens,
-            web_input_handler=_build_web_input_handler(backend, state),
             layout_provider=_build_layout_provider(config, state, layout_lock),
             layout_update_handler=_build_layout_update_handler(
                 config,
@@ -645,7 +665,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         )
         dashboard.start()
         print(f"Dashboard: {dashboard.url}")
-        print(f"Web controller: {_controller_url(config)}")
+        print("Web controller: disabled pending disconnect-recovery safeguards")
         print(f"Layout editor: {_layout_url(config)}")
         print(f"Pairing secret: {config.pairing_secret}")
         print(f"Management token: {config.api_token}")

@@ -105,9 +105,12 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             clipboard=client_clipboard,
         )
 
+        baseline_ready = self._watch_clipboard_baseline(connector)
         try:
             await connector.start()
             await self._wait_for_hosted_client(registry, "client")
+            await asyncio.wait_for(baseline_ready.wait(), timeout=3)
+            await self._wait_for_state(client_state, "last_clipboard_received")
             client_clipboard.set_text("copied from client")
             await self._wait_for_clipboard(host_clipboard, "copied from client")
         finally:
@@ -211,9 +214,14 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
             clipboard=client_clipboard,
         )
 
+        baseline_ready = self._watch_clipboard_baseline(connector)
         try:
             await connector.start()
             await self._wait_for_hosted_client(registry, "client")
+            # Registration precedes monitor initialization and the host's initial
+            # clipboard. Exercise image transfer after that initial sync settles.
+            await asyncio.wait_for(baseline_ready.wait(), timeout=3)
+            await self._wait_for_state(client_state, "last_clipboard_received")
             image = b"\x89PNG\r\n\x1a\nclient-image" + (b"x" * 90_000)
             client_clipboard.set_image_png(image)
             await self._wait_for_clipboard_image(host_clipboard, image)
@@ -558,6 +566,18 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
                 return client
             await asyncio.sleep(0.05)
         self.fail(f"{name} did not connect")
+
+    def _watch_clipboard_baseline(self, connector: ClientConnector) -> asyncio.Event:
+        ready = asyncio.Event()
+        read_payload = connector._read_clipboard_payload
+
+        async def read_after_baseline():
+            payload = await read_payload()
+            ready.set()
+            return payload
+
+        connector._read_clipboard_payload = read_after_baseline
+        return ready
 
     async def _wait_for_clipboard(self, clipboard: NullClipboard, expected: str) -> None:
         for _ in range(60):

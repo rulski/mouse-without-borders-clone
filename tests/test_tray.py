@@ -10,6 +10,7 @@ class TrayTests(unittest.TestCase):
     def test_url_helpers_normalize_dashboard_and_layout_urls(self) -> None:
         self.assertEqual(normalize_base_url("http://127.0.0.1:45446/"), "http://127.0.0.1:45446")
         self.assertEqual(dashboard_url("http://127.0.0.1:45446/"), "http://127.0.0.1:45446")
+        self.assertEqual(dashboard_url("http://127.0.0.1:45446/", "a&b"), "http://127.0.0.1:45446/#token=a%26b")
         self.assertEqual(
             layout_url("http://127.0.0.1:45446/", "secret"),
             "http://127.0.0.1:45446/layout#token=secret",

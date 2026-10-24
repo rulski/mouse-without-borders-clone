@@ -51,6 +51,25 @@ class FakeRemoteClient:
 
 
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_duplicate_edges_stay_local_with_actionable_error(self) -> None:
+        state = StateStore("host", "null")
+        controller = BorderController(AppConfig(peers=[PeerConfig(name="mac", edge="left"), PeerConfig(name="pc2", edge="left")]), NullBackend(), state)
+        await controller._maybe_activate(Point(0, 500))
+        self.assertIsNone(controller.active)
+        self.assertIn("one device per edge", state.snapshot()["last_error"])
+
+    async def test_layout_changed_during_connection_does_not_activate_old_edge(self) -> None:
+        peer = PeerConfig(name="mac", edge="left")
+        controller = BorderController(AppConfig(peers=[peer]), NullBackend(), StateStore("host", "null"))
+
+        async def resolve(_peer):
+            peer.edge = "top"
+            return FakeRemoteClient()
+
+        controller._resolve_client = resolve
+        await controller._maybe_activate(Point(0, 500))
+        self.assertIsNone(controller.active)
+
     async def test_return_discards_remote_key_and_motion_backlog(self) -> None:
         peer = PeerConfig(name="mac", edge="left")
         controller = BorderController(AppConfig(peers=[peer]), NullBackend(), StateStore("host", "null"))

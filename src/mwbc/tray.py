@@ -7,6 +7,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,12 +41,12 @@ def api_path(base_url: str, path: str) -> str:
     return f"{normalize_base_url(base_url)}{clean_path}"
 
 
-def dashboard_url(base_url: str) -> str:
-    return normalize_base_url(base_url)
+def dashboard_url(base_url: str, token: str = "") -> str:
+    return normalize_base_url(base_url) + (f"/#token={quote(token, safe='')}" if token else "")
 
 
 def layout_url(base_url: str, token: str) -> str:
-    return f"{api_path(base_url, '/layout')}#token={token}"
+    return f"{api_path(base_url, '/layout')}#token={quote(token, safe='')}"
 
 
 def controller_url(base_url: str, token: str) -> str:
@@ -220,7 +221,6 @@ class TrayApp:
             item("Open Smith MWBC", self._open_smith),
             item("Open MWBC Dashboard", self._open_dashboard, enabled=snapshot.online),
             item("Open Layout Editor", self._open_layout, enabled=snapshot.online),
-            item("Open Web Controller", self._open_controller, enabled=snapshot.online),
             menu.SEPARATOR,
         ]
         if snapshot.online:
@@ -272,7 +272,7 @@ class TrayApp:
         self._open_url(self.smith_url)
 
     def _open_dashboard(self, _icon: Any = None, _item: Any = None) -> None:
-        self._open_url(dashboard_url(self.api_url))
+        self._open_url(dashboard_url(self.api_url, self.token))
 
     def _open_layout(self, _icon: Any = None, _item: Any = None) -> None:
         self._open_url(layout_url(self.api_url, self.token))

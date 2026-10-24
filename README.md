@@ -11,7 +11,7 @@ It is an MVP, not a kernel-level input driver. Native input capture/injection is
 - Always-looking client mode that reconnects to a host until it is available.
 - Agent mode for receiving mouse, keyboard, click, and scroll events.
 - Controller mode that switches to a peer when the pointer hits an edge.
-- Browser controller mode for locked-down devices that can open a web page but cannot run an executable.
+- Browser controller mode is temporarily disabled pending server-side ownership and disconnect-recovery safeguards. Native device sharing is unchanged.
 - Host layout editor for moving peer devices to the left, right, top, or bottom edge and controlling per-client features.
 - Host-controlled keep-awake mode for selected clients.
 - Bidirectional text and image clipboard sync between the host and always-looking clients.
@@ -164,7 +164,7 @@ Run the optional tray companion on the same machine as the MWBC host:
 mwbc tray --smith-url http://localhost:3000/mwbc
 ```
 
-The tray icon shows whether MWBC is offline, running, connected to devices, or locked to the host with `F12`. Its menu can open Smith Command Center, the MWBC dashboard, the layout editor, and the web controller. It can also start the host when MWBC is stopped, or stop/restart the running local daemon.
+The tray icon shows whether MWBC is offline, running, connected to devices, or locked to the host with `F12`. Its menu can open Smith Command Center, the MWBC dashboard, and the layout editor. It can also start the host when MWBC is stopped, or stop/restart the running local daemon.
 
 The tray is intentionally separate from the daemon. That means it can stay open and offer `Start Host` even when the main MWBC process is not running.
 
@@ -177,7 +177,19 @@ Layout editor: http://127.0.0.1:45446/layout#token=...
 Pairing secret: ...
 ```
 
-Open that URL on the host. Drag devices to the edge where they physically sit, or use each device's edge selector. Changes are saved to `~/.mwbc/config.json` and the running host refreshes immediately.
+Open that URL on the host. Drag devices to the edge where they physically sit, or use each device's edge selector. Click **Save** to apply the complete layout to `~/.mwbc/config.json` and the running host. Edits are not autosaved. Only one save can run at a time; failed saves preserve your draft for correction and retry.
+
+Assign one device per edge. To swap devices, change both assignments before
+saving. Conflicting assignments are rejected without changing the saved layout.
+Older conflicting layouts stay editable, but switching through that edge is
+blocked until corrected; MWBC does not silently choose a device or rearrange it.
+Press F12 to return control locally before moving the currently active device.
+Changing settings does not replace the device controls or discard keyboard focus.
+
+Navigation between Dashboard and Layout preserves an existing token fragment in
+the same tab. A bare layout URL is read-only; open Layout from the tray or Smith
+to obtain the authorized URL. Tokens are not embedded in public page responses
+or stored in browser local/session storage.
 
 The host UI is also where client features are controlled. For now, each client has a `Keep awake` checkbox and interval. When enabled, the host sends that setting to the connected client, and the client performs a tiny local mouse nudge at the configured interval so that device stays awake. The nudge pauses while the host is actively controlling that client.
 
@@ -211,7 +223,7 @@ GET /api/v1/status
 GET /api/v1/service
 ```
 
-The public service response intentionally omits secret-bearing controller and layout URLs. Send `X-MWBC-Token` with `GET /api/service` or `GET /api/v1/service` when Smith needs those private URLs.
+The public service response intentionally omits secret-bearing URLs. Send `X-MWBC-Token` with `GET /api/service` or `GET /api/v1/service` when Smith needs the private layout URL. `controller_url` is null while browser input is disabled; `/api/capabilities` reports `web_input: false`.
 
 Authenticated endpoints require the separate `api_token` in `X-MWBC-Token`.
 Peer pairing secrets no longer authorize dashboard, browser input, or service
@@ -261,31 +273,15 @@ mwbc host
 
 ## Browser Controller Mode
 
-Use this when the device with the physical mouse and keyboard cannot run local software, but it can open a browser. The receiving/target machine still needs to run MWBC because browsers cannot inject OS-level input into another machine by themselves.
+Browser input is temporarily unavailable. `/controller` explains this and the
+application rejects `/api/web-input` with HTTP 503, even with a valid token.
+Tray and Smith no longer advertise the controller. Native host/client and
+direct-agent modes are unaffected.
 
-On the target machine:
-
-```bash
-mwbc run --dashboard-host 127.0.0.1
-```
-
-The terminal prints a URL like:
-
-```text
-Web controller: http://127.0.0.1:45446/controller#token=...
-```
-
-For another device, publish this loopback service through a properly configured
-HTTPS reverse proxy with trusted certificates and access controls, then open the
-HTTPS controller URL with the management token fragment. Direct LAN HTTP binding
-is rejected. Press `Start` to enter pointer lock. Browser input is a separate
-management-authorized path, not an approved native TLS peer.
-
-Notes:
-
-- The URL fragment after `#token=` is the management token. Treat it like a password.
-- Some browser or OS-reserved key combinations may not be capturable from a normal web page.
-- Do not expose port `45446` directly to the LAN. Only expose the HTTPS proxy.
+Before browser input returns, tests must prove exclusive controller ownership
+and server-side release of held keys/buttons after a tab crash, sleep, or network
+loss. The browser's final reset request alone is not a sufficient safeguard.
+Do not expose dashboard port `45446` directly to the LAN.
 
 ## Startup/Login Install
 
@@ -430,8 +426,9 @@ as modifiers and mouse buttons during reset. Update both host and client for
 the full recovery behavior.
 
 Native connections now require mutual TLS and explicit device-role approval,
-with session-bound sequence enforcement. Layout routing and clipboard
-responsiveness remain the next stages. Native Windows/macOS two-device behavior
+with session-bound sequence enforcement. Layout saving validates one device per
+edge before persistence and blocks active-device movement until control returns
+locally. Clipboard responsiveness remains a separate next stage. Native Windows/macOS two-device behavior
 must still be validated after upgrading and pairing both devices.
 
 The suite can run from this source checkout with the base package dependencies
@@ -448,3 +445,17 @@ testing in the desktop OS session. Pairing configuration is stored outside
 this repository at `~/.mwbc/config.json`; keep it in an approved private
 recovery location. GitHub contains committed code only. Preserve existing
 uncommitted code and documentation changes in a separate source snapshot.
+
+### TLS test troubleshooting
+
+If otherwise paired local test connections fail with `CERTIFICATE_VERIFY_FAILED`,
+check antivirus HTTPS/SSL inspection before changing certificates or trust.
+On this workstation, AVG Web/Mail Shield replaced temporary loopback test
+certificates with certificates issued by `AVG Web/Mail Shield Self-signed Root`.
+The unchanged 115-test suite passed after that interception was removed; all
+27 security tests also passed in an isolated Linux environment.
+
+Use a narrowly scoped SSL/TLS-inspection exception for the MWBC Python executable
+where supported, rather than disabling antivirus protection globally. Never
+disable certificate verification or approve an interception certificate to
+make MWBC connect. Keep mutual TLS and explicit device fingerprints enabled.

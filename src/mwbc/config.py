@@ -79,6 +79,14 @@ class PeerConfig:
         }
 
 
+def validate_peer_edges(peers: list[PeerConfig]) -> None:
+    occupied: dict[str, str] = {}
+    for peer in peers:
+        if peer.edge in occupied:
+            raise ValueError(f"{occupied[peer.edge]} and {peer.name} both use {peer.edge}; choose a different edge for one device")
+        occupied[peer.edge] = peer.name
+
+
 @dataclass(slots=True)
 class AppConfig:
     machine_name: str = field(default_factory=socket.gethostname)

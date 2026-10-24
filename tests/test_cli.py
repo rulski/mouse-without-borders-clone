@@ -6,6 +6,8 @@ import json
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
 from mwbc.cli import _build_layout_update_handler, _build_management_handler, _service_status_payload
@@ -14,6 +16,71 @@ from mwbc.state import StateStore
 
 
 class CliLayoutTests(unittest.TestCase):
+    def test_layout_invalid_candidates_do_not_change_memory_disk_or_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "config.json"
+            config = AppConfig(peers=[PeerConfig(name="MACBOOK", edge="left"), PeerConfig(name="PC2", edge="top")])
+            save_config(config, path)
+            state = StateStore("HOST", "null")
+            loop = asyncio.new_event_loop()
+            self.addCleanup(loop.close)
+            handler = _build_layout_update_handler(config, path, state, {"controller": None}, None, loop, threading.RLock())
+            before = path.read_bytes()
+            memory = config.to_dict()
+            snapshot = state.snapshot()["peers"]
+            invalid = [
+                [{"name": "PC2", "edge": "left"}],
+                [{"name": "MACBOOK", "edge": "bottom"}, {"name": "MISSING", "edge": "right"}],
+                [{"name": "MACBOOK", "edge": "bottom"}, {"name": "MACBOOK", "edge": "right"}],
+                [{"name": "MACBOOK", "edge": "bottom", "keep_awake_interval_seconds": float("nan")}],
+            ]
+            for peers in invalid:
+                with self.subTest(peers=peers), self.assertRaises(ValueError):
+                    handler({"peers": peers})
+                self.assertEqual(config.to_dict(), memory)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(state.snapshot()["peers"], snapshot)
+
+    def test_layout_disk_failure_does_not_change_running_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "config.json"
+            config = AppConfig(peers=[PeerConfig(name="MACBOOK", edge="left")])
+            save_config(config, path)
+            loop = asyncio.new_event_loop()
+            self.addCleanup(loop.close)
+            handler = _build_layout_update_handler(config, path, StateStore("HOST", "null"), {"controller": None}, None, loop, threading.RLock())
+            before = path.read_bytes()
+            with patch("mwbc.cli.save_config", side_effect=OSError("disk full")), self.assertRaises(OSError):
+                handler({"peers": [{"name": "MACBOOK", "edge": "top"}]})
+            self.assertEqual(config.peers[0].edge, "left")
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_active_device_cannot_move_until_control_returns_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "config.json"
+            config = AppConfig(peers=[PeerConfig(name="MACBOOK", edge="left")])
+            save_config(config, path)
+            loop = asyncio.new_event_loop()
+            self.addCleanup(loop.close)
+            controller = SimpleNamespace(active=SimpleNamespace(peer=config.peers[0]))
+            handler = _build_layout_update_handler(config, path, StateStore("HOST", "null"), {"controller": controller}, None, loop, threading.RLock())
+            with self.assertRaisesRegex(ValueError, "F12"):
+                handler({"peers": [{"name": "MACBOOK", "edge": "top"}]})
+            self.assertEqual(controller.active.peer.edge, "left")
+            self.assertEqual(load_config(path).peers[0].edge, "left")
+            controller.active = None
+            handler({"peers": [{"name": "MACBOOK", "edge": "top"}]})
+            self.assertEqual(config.peers[0].edge, "top")
+
+    def test_layout_can_swap_two_edges_in_one_save(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            config = AppConfig(peers=[PeerConfig(name="MACBOOK", edge="left"), PeerConfig(name="PC2", edge="top")])
+            loop = asyncio.new_event_loop()
+            self.addCleanup(loop.close)
+            handler = _build_layout_update_handler(config, Path(tempdir) / "config.json", StateStore("HOST", "null"), {"controller": None}, None, loop, threading.RLock())
+            result = handler({"peers": [{"name": "MACBOOK", "edge": "top"}, {"name": "PC2", "edge": "left"}]})
+            self.assertEqual([peer["edge"] for peer in result["peers"]], ["top", "left"])
+
     def test_layout_handler_persists_peer_feature_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             config_path = Path(tempdir) / "config.json"
@@ -124,7 +191,7 @@ class CliLayoutTests(unittest.TestCase):
         payload = _service_status_payload(config, args, state, include_private=True)
 
         self.assertIn("#token=" + config.api_token, payload["layout_url"])
-        self.assertIn("#token=" + config.api_token, payload["controller_url"])
+        self.assertIsNone(payload["controller_url"])
         self.assertNotIn("#token=secret", payload["layout_url"])
         self.assertTrue(payload["authenticated"])
 
@@ -140,6 +207,24 @@ class CliLayoutTests(unittest.TestCase):
 
             self.assertTrue(config.device_id)
             self.assertEqual(load_config(config_path).device_id, config.device_id)
+
+
+class CliLayoutLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dashboard_thread_checks_active_session_on_controller_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "config.json"
+            config = AppConfig(peers=[PeerConfig(name="MACBOOK", edge="left")])
+            save_config(config, path)
+            controller = SimpleNamespace(active=SimpleNamespace(peer=config.peers[0]), refresh_peers=AsyncMock())
+            handler = _build_layout_update_handler(config, path, StateStore("HOST", "null"), {"controller": controller}, None, asyncio.get_running_loop(), threading.RLock())
+            with self.assertRaisesRegex(ValueError, "F12"):
+                await asyncio.to_thread(handler, {"peers": [{"name": "MACBOOK", "edge": "top"}]})
+            self.assertEqual(load_config(path).peers[0].edge, "left")
+            controller.active = None
+            await asyncio.to_thread(handler, {"peers": [{"name": "MACBOOK", "edge": "top"}]})
+            await asyncio.sleep(0)
+            self.assertEqual(load_config(path).peers[0].edge, "top")
+            controller.refresh_peers.assert_awaited_once()
 
 
 if __name__ == "__main__":
